@@ -4,11 +4,10 @@ This repository contains an end-to-end example of deploying [BEVFormer](https://
 
 # Requirements
 - TensorRT 10.x
-- ONNX-Runtime 1.20.x
 - onnx-graphsurgeon
-- onnxsim
-- [ModelOpt toolkit](https://github.com/NVIDIA/TensorRT-Model-Optimizer) 0.29.0
+- [ModelOpt toolkit](https://github.com/NVIDIA/Model-Optimizer) 0.41.0
 - [BEVFormer_tensorrt](https://github.com/DerryHub/BEVFormer_tensorrt)
+- PyTorch 2.9.0
 
 ## Prepare dataset
 Follow the [Data Preparation steps](https://github.com/DerryHub/BEVFormer_tensorrt#nuscenes-and-can-bus-for-bevformer) for NuScenes and CAN bus.
@@ -17,7 +16,7 @@ Follow the [Data Preparation steps](https://github.com/DerryHub/BEVFormer_tensor
 ## Prepare docker image
 Build docker image:
 ```bash
-$ export TAG=tensorrt_bevformer:25.04
+$ export TAG=tensorrt_bevformer:26.01
 $ docker build -f docker/tensorrt.Dockerfile --no-cache --tag=$TAG .
 ```
 
@@ -86,8 +85,7 @@ $ PYTHONPATH=$(pwd) python /mnt/tools/calib_data_prep.py configs/bevformer/plugi
 $ python -m modelopt.onnx.quantization --onnx_path=/mnt/models/bevformer_tiny_epoch_24_cp2_op13.onnx \
       --trt_plugins=$PLUGIN_PATH \
       --op_types_to_exclude MatMul \
-      --calibration_data_path=/workspace/BEVFormer_tensorrt/data/nuscenes/calib_data.npz \
-      --simplify
+      --calibration_data_path=/workspace/BEVFormer_tensorrt/data/nuscenes/calib_data.npz
 ```
 > This generates an ONNX model with suffix `.quant.onnx` with Q/DQ nodes around relevant layers.
 
@@ -98,7 +96,6 @@ $ python -m modelopt.onnx.quantization --onnx_path=/mnt/models/bevformer_tiny_ep
   This is up to the user to decide.
 - If you're running out of memory, you may need to add `CUDA_MODULE_LOADING=LAZY` to the beginning of that
   quantization command. This is only valid for CUDA 12.x. No such variable is needed with CUDA 11.8.
-- The `--simplify` flag is optional.
 - If you wish to simply check the explicitly quantized model's runtime performance, without considering its accuracy,
   you may also skip using the `--calibration_data_path` flag (and thus `Step 2` altogether).
 
@@ -107,7 +104,7 @@ $ python -m modelopt.onnx.quantization --onnx_path=/mnt/models/bevformer_tiny_ep
 $ trtexec --onnx=/mnt/models/bevformer_tiny_epoch_24_cp2_op13.quant.onnx \
 	      --saveEngine=/mnt/models/bevformer_tiny_epoch_24_cp2_op13.quant.engine \
 	      --staticPlugins=$PLUGIN_PATH \
-	      --best
+	      --stronglyTyped
 ```
 
 **Note**: In order to deploy the quantized ONNX model in another platform or with another TensorRT version, simply
@@ -124,25 +121,25 @@ $ python tools/bevformer/evaluate_trt.py \
 ```
 
 # Results
-**System**: NVIDIA A40 GPU, TensorRT 10.9.0.34
+**System**: NVIDIA A40 GPU, TensorRT 10.14.1.48
 
 BEVFormer tiny with FP16 plugins with `nv_half2` (`bevformer_tiny_epoch_24_cp2_op13.onnx`):
 
-| Precision                                       | GPU Compute Time (median, ms) | Accuracy (NDS / mAP)   |
-|-------------------------------------------------|-------------------------------|------------------------|
-| FP32                                            | 17.82                         | NDS: 0.355, mAP: 0.252 |
-| FP16                                            | 8.91                          | NDS: 0.355, mAP: 0.252 |
-| BEST (TensorRT PTQ - Implicit Quantization)     | 6.00                          | NDS: 0.353, mAP: 0.249 |
-| QDQ_BEST (ModelOpt PTQ - Explicit Quantization) | 5.75                          | NDS: 0.352, mAP: 0.251 |
+| Precision                                               | GPU Compute Time (median, ms) | Accuracy (NDS / mAP)   |
+|---------------------------------------------------------|-------------------------------|------------------------|
+| FP32                                                    | 18.68                         | NDS: 0.355, mAP: 0.252 |
+| FP16                                                    | 9.27                          | NDS: 0.355, mAP: 0.252 |
+| IQ_BEST (TensorRT PTQ - Implicit Quantization)          | 6.16                          | NDS: 0.353, mAP: 0.249 |
+| EQ_StronglyTyped (ModelOpt PTQ - Explicit Quantization) | 5.76                          | NDS: 0.352, mAP: 0.251 |
 
 BEVFormer tiny with FP16 plugins with `nv_half` (`bevformer_tiny_epoch_24_cp_op13.onnx`):
 
-| Precision                                       | GPU Compute Time (median, ms) | Accuracy (NDS / mAP)   |
-|-------------------------------------------------|-------------------------------|------------------------|
-| FP32                                            | 17.79                         | NDS: 0.355, mAP: 0.252 |
-| FP16                                            | 9.46                          | NDS: 0.355, mAP: 0.252 |
-| BEST (TensorRT PTQ - Implicit Quantization)     | 6.30                          | NDS: 0.347, mAP: 0.248 |
-| QDQ_BEST (ModelOpt PTQ - Explicit Quantization) | 6.22                          | NDS: 0.352, mAP: 0.251 |
+| Precision                                               | GPU Compute Time (median, ms) | Accuracy (NDS / mAP)   |
+|---------------------------------------------------------|-------------------------------|------------------------|
+| FP32                                                    | 18.65                         | NDS: 0.355, mAP: 0.252 |
+| FP16                                                    | 9.72                          | NDS: 0.355, mAP: 0.252 |
+| IQ_BEST (TensorRT PTQ - Implicit Quantization)          | 6.41                          | NDS: 0.352, mAP: 0.248 |
+| EQ_StronglyTyped (ModelOpt PTQ - Explicit Quantization) | 6.22                          | NDS: 0.352, mAP: 0.251 |
 
 ## Steps to reproduce
 To reproduce the results, run:

@@ -243,6 +243,9 @@ def load_ort_supported_model(
             onnx.helper.make_opsetid(trt_plugin_domain, trt_plugin_version)
         )
 
+    # Avoids error: "Unsupported model IR version: 12, max supported IR version: 10"
+    onnx_model.ir_version = 10
+
     return onnx_model, has_custom_op, custom_ops
 
 

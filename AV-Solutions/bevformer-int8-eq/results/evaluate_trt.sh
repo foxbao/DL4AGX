@@ -1,5 +1,5 @@
 MODEL_DIR="/mnt/models"
-TRT_VERSION="10.9.0.34"
+TRT_VERSION="10.14.1.48"
 DEVICE="A40"
 LOGS_DIR="${MODEL_DIR}/logs_${DEVICE}_trt${TRT_VERSION}"
 BEVFORMER_REPO=/workspace/BEVFormer_tensorrt
@@ -32,18 +32,15 @@ for (( i=0; i<$len; i++ )); do
   done
 
   echo "Quantized - ModelOpt PTQ (Explicit Quantization):"
-  for PRECISION in best; do
-    echo "  - ${PRECISION}"
-    ENGINE_PATH=${LOGS_DIR}/${MODEL_NAME}_qat_${PRECISION}
-    python tools/bevformer/evaluate_trt.py \
-            configs/bevformer/plugin/bevformer_tiny_trt_p2.py \
-            ${ENGINE_PATH}.engine \
-            --trt_plugins=$PLUGIN_PATH | tee ${ENGINE_PATH}_acc.log
-    wait
-  done
+  ENGINE_PATH=${LOGS_DIR}/${MODEL_NAME}_EQ_stronglyTyped
+  python tools/bevformer/evaluate_trt.py \
+          configs/bevformer/plugin/bevformer_tiny_trt_p2.py \
+          ${ENGINE_PATH}.engine \
+          --trt_plugins=$PLUGIN_PATH | tee ${ENGINE_PATH}_acc.log
+  wait
 
   echo "Quantized - TensorRT PTQ (Implicit Quantization):"
-  ENGINE_PATH=${LOGS_DIR}/${MODEL_NAME}_IQ_PTQ
+  ENGINE_PATH=${LOGS_DIR}/${MODEL_NAME}_IQ_best
   python tools/bevformer/evaluate_trt.py \
           configs/bevformer/plugin/bevformer_tiny_trt_p2.py \
           ${ENGINE_PATH}.engine \

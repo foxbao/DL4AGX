@@ -1,6 +1,6 @@
 MODEL_DIR="/mnt/models"
 CALIB_PATH="/workspace/BEVFormer_tensorrt/data/nuscenes/calib_data.npz"
-TRT_VERSION="10.9.0.34"
+TRT_VERSION="10.14.1.48"
 DEVICE="A40"
 
 LOGS_DIR="${MODEL_DIR}/logs_${DEVICE}_trt${TRT_VERSION}"
@@ -44,21 +44,17 @@ for (( i=0; i<$len; i++ )); do
       --output_path=${MODEL_DIR}/${MODEL_NAME}.quant.onnx \
       --trt_plugins=$PLUGIN_PATH \
       --op_types_to_exclude MatMul \
-      --calibration_data_path=$CALIB_PATH \
-      --simplify
+      --calibration_data_path=$CALIB_PATH
   wait
-  for PRECISION in best; do
-    echo "    - ${PRECISION}"
-    trtexec --onnx=${MODEL_DIR}/${MODEL_NAME}.quant.onnx \
-            --staticPlugins=$PLUGIN_PATH \
-            --saveEngine=${LOGS_DIR}/${MODEL_NAME}_qat_${PRECISION}.engine \
-            --${PRECISION} &> ${LOGS_DIR}/${MODEL_NAME}_qat_${PRECISION}_trtexec.log
-    wait
-  done
+  trtexec --onnx=${MODEL_DIR}/${MODEL_NAME}.quant.onnx \
+          --staticPlugins=$PLUGIN_PATH \
+          --saveEngine=${LOGS_DIR}/${MODEL_NAME}_EQ_stronglyTyped.engine \
+          --stronglyTyped &> ${LOGS_DIR}/${MODEL_NAME}_EQ_stronglyTyped_trtexec.log
+  wait
 
   echo "Quantize model - TensorRT PTQ (Implicit Quantization):"
   cd $BEVFORMER_REPO
-  IQ_ENGINE_PATH=${LOGS_DIR}/${MODEL_NAME}_IQ_PTQ
+  IQ_ENGINE_PATH=${LOGS_DIR}/${MODEL_NAME}_IQ_best
   python /mnt/results/onnx2trt_calib_npz.py configs/bevformer/plugin/bevformer_tiny_trt_p2.py \
         --onnx_path=${MODEL_DIR}/${MODEL_NAME}.onnx \
         --output=${IQ_ENGINE_PATH}.engine \
