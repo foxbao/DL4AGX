@@ -1,6 +1,6 @@
 [submodule "AV-Solutions/uniad-trt/UniAD"]
 	path = AV-Solutions/uniad-trt/UniAD
-	url = https://github.com/OpenDriveLab/UniAD.git
+	url = https://github.com/foxbao/UniAD.git
 	ignore = dirty
 [submodule "AV-Solutions/uniad-trt/dependencies/BEVFormer_tensorrt"]
 	path = AV-Solutions/uniad-trt/dependencies/BEVFormer_tensorrt
