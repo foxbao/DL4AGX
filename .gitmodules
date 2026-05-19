@@ -4,7 +4,7 @@
 	ignore = dirty
 [submodule "AV-Solutions/uniad-trt/dependencies/BEVFormer_tensorrt"]
 	path = AV-Solutions/uniad-trt/dependencies/BEVFormer_tensorrt
-	url = https://github.com/DerryHub/BEVFormer_tensorrt.git
+	url = https://github.com/foxbao/BEVFormer_tensorrt.git
 	ignore = dirty
 [submodule "AV-Solutions/uniad-trt/dependencies/nuscenes-devkit"]
 	path = AV-Solutions/uniad-trt/dependencies/nuscenes-devkit
