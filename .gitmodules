@@ -1,7 +1,8 @@
-[submodule "AV-Solutions/uniad-trt/UniAD_train/UniAD"]
-	path = AV-Solutions/uniad-trt/UniAD_train/UniAD
+[submodule "AV-Solutions/uniad-trt/UniAD_kl_train/UniAD"]
+	path = AV-Solutions/uniad-trt/UniAD_kl_train/UniAD
 	url = git@github.com:foxbao/UniAD.git
 	ignore = dirty
+	branch = train/kl-lidar
 [submodule "AV-Solutions/uniad-trt/dependencies/BEVFormer_tensorrt"]
 	path = AV-Solutions/uniad-trt/dependencies/BEVFormer_tensorrt
 	url = git@github.com:foxbao/BEVFormer_tensorrt.git
@@ -29,4 +30,9 @@
 [submodule "AV-Solutions/uniad-trt/UniAD"]
 	path = AV-Solutions/uniad-trt/UniAD
 	url = git@github.com:foxbao/UniAD.git
+	ignore = dirty
+[submodule "AV-Solutions/uniad-trt/UniAD_train/UniAD"]
+	path = AV-Solutions/uniad-trt/UniAD_train/UniAD
+	url = git@github.com:foxbao/UniAD.git
+	branch = train/uniad-tiny
 	ignore = dirty
