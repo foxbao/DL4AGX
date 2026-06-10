@@ -80,7 +80,7 @@ add_executable(validate_sparse
   ${GENERATED_PROTO_SRCS}
 )
 
-target_include_directories(validate_sparse PRIVATE
+set(SPARSE_RUNTIME_INCLUDES
   ${GENERATED_PROTO_ROOT}
   ${SPARSE_CONV_ROOT}/src
   ${SPARSE_CONV_ROOT}/libspconv/include
@@ -88,11 +88,11 @@ target_include_directories(validate_sparse PRIVATE
   ${Protobuf_INCLUDE_DIRS}
 )
 
-target_link_directories(validate_sparse PRIVATE
+set(SPARSE_RUNTIME_LIB_DIRS
   ${SPCONV_LIB_DIR}
 )
 
-target_link_libraries(validate_sparse PRIVATE
+set(SPARSE_RUNTIME_LIBS
   spconv
   protobuf::libprotobuf
   ${CUDART_LIBRARY}
@@ -100,7 +100,51 @@ target_link_libraries(validate_sparse PRIVATE
   pthread
 )
 
+target_include_directories(validate_sparse PRIVATE ${SPARSE_RUNTIME_INCLUDES})
+target_link_directories(validate_sparse PRIVATE ${SPARSE_RUNTIME_LIB_DIRS})
+target_link_libraries(validate_sparse PRIVATE ${SPARSE_RUNTIME_LIBS})
+
 set_target_properties(validate_sparse PROPERTIES
   BUILD_RPATH "${SPCONV_LIB_DIR};${CUDA_LIBRARY_DIRS}"
   INSTALL_RPATH "${SPCONV_LIB_DIR};${CUDA_LIBRARY_DIRS}"
 )
+
+if(TENSORRT_PATH)
+  set(TENSORRT_INCLUDE_DIRS ${TENSORRT_PATH}/include)
+  set(TENSORRT_LIBRARY_DIRS ${TENSORRT_PATH}/lib)
+  find_library(NVINFER_LIBRARY nvinfer PATHS ${TENSORRT_LIBRARY_DIRS} NO_DEFAULT_PATH)
+  find_library(NVINFER_PLUGIN_LIBRARY nvinfer_plugin PATHS ${TENSORRT_LIBRARY_DIRS} NO_DEFAULT_PATH)
+  if(NOT EXISTS ${TENSORRT_INCLUDE_DIRS}/NvInfer.h OR
+     NOT NVINFER_LIBRARY OR
+     NOT NVINFER_PLUGIN_LIBRARY)
+    message(FATAL_ERROR "Invalid TensorRT path: ${TENSORRT_PATH}")
+  endif()
+
+  set(ENQUEUE_V3_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../enqueueV3)
+  add_executable(validate_sparse_trt
+    src/validate_sparse_trt.cpp
+    ${GENERATED_PROTO_ROOT}/onnx-parser.cpp
+    ${GENERATED_PROTO_SRCS}
+    ${ENQUEUE_V3_ROOT}/src/tensorrt.cpp
+  )
+  target_include_directories(validate_sparse_trt PRIVATE
+    ${SPARSE_RUNTIME_INCLUDES}
+    ${ENQUEUE_V3_ROOT}/include
+    ${TENSORRT_INCLUDE_DIRS}
+  )
+  target_link_directories(validate_sparse_trt PRIVATE
+    ${SPARSE_RUNTIME_LIB_DIRS}
+    ${TENSORRT_LIBRARY_DIRS}
+  )
+  target_link_libraries(validate_sparse_trt PRIVATE
+    ${SPARSE_RUNTIME_LIBS}
+    ${NVINFER_LIBRARY}
+    ${NVINFER_PLUGIN_LIBRARY}
+  )
+  set_target_properties(validate_sparse_trt PROPERTIES
+    BUILD_RPATH "${SPCONV_LIB_DIR};${CUDA_LIBRARY_DIRS};${TENSORRT_LIBRARY_DIRS}"
+    INSTALL_RPATH "${SPCONV_LIB_DIR};${CUDA_LIBRARY_DIRS};${TENSORRT_LIBRARY_DIRS}"
+  )
+else()
+  message(STATUS "TENSORRT_PATH is not set; validate_sparse_trt target is disabled")
+endif()
