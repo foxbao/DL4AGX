@@ -59,7 +59,7 @@ python tools/prepare_bevformer_lidar_deploy_data.py \
   --split test \
   --start-index 0 \
   --max-frames 1 \
-  --out-dir dumped_inputs/bevformer_lidar_deploy_data_epoch2
+  --out-dir dumped_inputs/bevformer_lidar_deploy_data
 
 cd -
 ```
@@ -90,12 +90,12 @@ cmake --build inference_app/sparse_lidar/build -j$(nproc)
   UniAD/engine/bevformer_lidar_backbone_neck_epoch2_trt10.7_sm89.engine \
   UniAD/engine/bevformer_lidar_bev_trt_epoch2_trt10.7_sm89.engine \
   inference_app/enqueueV3/build_trt107/libuniad_plugin.so \
-  UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data_epoch2 \
+  UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data \
   inference_app/sparse_lidar/build/uniad_lidar_epoch2_deploy_data \
   1 \
   41 960 1280 \
-  --metadata-json UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data_epoch2 \
-  --gt-detections UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data_epoch2 \
+  --metadata-json UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data \
+  --gt-detections UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data \
   --score-threshold 0.05 \
   --bev-score-threshold 0.05
 ```
