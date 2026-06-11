@@ -267,6 +267,61 @@ void parse_matrix4x4(const JsonValue& value, FrameMetadata* metadata) {
   metadata->has_ego_motion_delta = true;
 }
 
+struct Rotation2D {
+  float r00 = 1.0f;
+  float r01 = 0.0f;
+  float r10 = 0.0f;
+  float r11 = 1.0f;
+  bool is_identity = true;
+};
+
+float determinant3x3(const float* m) {
+  return m[0] * (m[5] * m[10] - m[6] * m[9]) -
+         m[1] * (m[4] * m[10] - m[6] * m[8]) +
+         m[2] * (m[4] * m[9] - m[5] * m[8]);
+}
+
+Rotation2D prev_from_current_rotation(const FrameMetadata& metadata) {
+  Rotation2D rotation;
+  if (!metadata.has_ego_motion_delta ||
+      (metadata.has_prev_bev_exists && !metadata.prev_bev_exists)) {
+    return rotation;
+  }
+
+  const float* m = metadata.ego_motion_delta;
+  const float det = determinant3x3(m);
+  if (std::fabs(det) < 1e-6f) {
+    return rotation;
+  }
+
+  rotation.r00 = (m[5] * m[10] - m[6] * m[9]) / det;
+  rotation.r01 = (m[2] * m[9] - m[1] * m[10]) / det;
+  rotation.r10 = (m[6] * m[8] - m[4] * m[10]) / det;
+  rotation.r11 = (m[0] * m[10] - m[2] * m[8]) / det;
+  rotation.is_identity =
+      std::fabs(rotation.r00 - 1.0f) < 1e-7f &&
+      std::fabs(rotation.r01) < 1e-7f &&
+      std::fabs(rotation.r10) < 1e-7f &&
+      std::fabs(rotation.r11 - 1.0f) < 1e-7f;
+  return rotation;
+}
+
+struct BilinearSample {
+  int i00 = -1;
+  int i01 = -1;
+  int i10 = -1;
+  int i11 = -1;
+  float w00 = 0.0f;
+  float w01 = 0.0f;
+  float w10 = 0.0f;
+  float w11 = 0.0f;
+};
+
+int spatial_index_or_invalid(int y, int x, int height, int width) {
+  if (x < 0 || x >= width || y < 0 || y >= height) return -1;
+  return y * width + x;
+}
+
 }  // namespace
 
 FrameMetadata read_frame_metadata(const std::string& path) {
@@ -307,6 +362,100 @@ std::vector<float> shift_from_metadata(
   }
 
   fail("Metadata shift without rotate_prev_bev is not implemented.");
+}
+
+std::vector<float> rotate_prev_bev_from_metadata(
+    const std::vector<float>& prev_bev,
+    const FrameMetadata& metadata,
+    const BevGridSpec& grid) {
+  require(grid.batch_size > 0 && grid.channels > 0 &&
+              grid.height > 0 && grid.width > 0,
+          "Invalid BEV grid shape.");
+  require(grid.batch_size == 1,
+          "LiDAR prev_bev metadata rotation currently supports batch size 1.");
+  require(grid.x_max > grid.x_min && grid.y_max > grid.y_min,
+          "Invalid BEV point cloud range.");
+
+  const size_t spatial =
+      static_cast<size_t>(grid.height) * static_cast<size_t>(grid.width);
+  const size_t expected =
+      static_cast<size_t>(grid.batch_size) *
+      static_cast<size_t>(grid.channels) * spatial;
+  require(prev_bev.size() == expected,
+          "prev_bev size does not match BEV grid shape.");
+
+  const Rotation2D rotation = prev_from_current_rotation(metadata);
+  if (rotation.is_identity) {
+    return prev_bev;
+  }
+
+  const float x_extent = grid.x_max - grid.x_min;
+  const float y_extent = grid.y_max - grid.y_min;
+  const float cell_x = x_extent / static_cast<float>(grid.width);
+  const float cell_y = y_extent / static_cast<float>(grid.height);
+
+  std::vector<BilinearSample> samples(spatial);
+  for (int y = 0; y < grid.height; ++y) {
+    const float world_y = grid.y_min + (static_cast<float>(y) + 0.5f) * cell_y;
+    for (int x = 0; x < grid.width; ++x) {
+      const float world_x =
+          grid.x_min + (static_cast<float>(x) + 0.5f) * cell_x;
+      const float src_x = rotation.r00 * world_x + rotation.r01 * world_y;
+      const float src_y = rotation.r10 * world_x + rotation.r11 * world_y;
+      const float ix = (src_x - grid.x_min) / x_extent *
+                           static_cast<float>(grid.width) -
+                       0.5f;
+      const float iy = (src_y - grid.y_min) / y_extent *
+                           static_cast<float>(grid.height) -
+                       0.5f;
+
+      const int x0 = static_cast<int>(std::floor(ix));
+      const int y0 = static_cast<int>(std::floor(iy));
+      const int x1 = x0 + 1;
+      const int y1 = y0 + 1;
+      const float wx = ix - static_cast<float>(x0);
+      const float wy = iy - static_cast<float>(y0);
+
+      BilinearSample sample;
+      sample.i00 = spatial_index_or_invalid(y0, x0, grid.height, grid.width);
+      sample.i01 = spatial_index_or_invalid(y0, x1, grid.height, grid.width);
+      sample.i10 = spatial_index_or_invalid(y1, x0, grid.height, grid.width);
+      sample.i11 = spatial_index_or_invalid(y1, x1, grid.height, grid.width);
+      sample.w00 = (1.0f - wx) * (1.0f - wy);
+      sample.w01 = wx * (1.0f - wy);
+      sample.w10 = (1.0f - wx) * wy;
+      sample.w11 = wx * wy;
+      samples[static_cast<size_t>(y) * static_cast<size_t>(grid.width) +
+              static_cast<size_t>(x)] = sample;
+    }
+  }
+
+  std::vector<float> rotated(prev_bev.size(), 0.0f);
+  for (int batch = 0; batch < grid.batch_size; ++batch) {
+    for (int channel = 0; channel < grid.channels; ++channel) {
+      const size_t base =
+          (static_cast<size_t>(batch) * static_cast<size_t>(grid.channels) +
+           static_cast<size_t>(channel)) * spatial;
+      for (size_t i = 0; i < spatial; ++i) {
+        const BilinearSample& sample = samples[i];
+        float value = 0.0f;
+        if (sample.i00 >= 0) {
+          value += sample.w00 * prev_bev[base + static_cast<size_t>(sample.i00)];
+        }
+        if (sample.i01 >= 0) {
+          value += sample.w01 * prev_bev[base + static_cast<size_t>(sample.i01)];
+        }
+        if (sample.i10 >= 0) {
+          value += sample.w10 * prev_bev[base + static_cast<size_t>(sample.i10)];
+        }
+        if (sample.i11 >= 0) {
+          value += sample.w11 * prev_bev[base + static_cast<size_t>(sample.i11)];
+        }
+        rotated[base + i] = value;
+      }
+    }
+  }
+  return rotated;
 }
 
 }  // namespace uniad_lidar

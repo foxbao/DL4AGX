@@ -87,6 +87,11 @@ manifest.json               # config、split、token、scene、文件列表
 
 如果只需要纯部署输入，不需要画 GT 对比，加 `--no-gt`。
 
+多帧部署时，把 `--max-frames` 改成需要的帧数即可。脚本会连续写
+`raw_points_000000.bin`、`img_metas_000000.json` 等文件；metadata 里的
+`prev_bev_exists` 和 `ego_motion_delta` 会被 C++ runtime 用来处理
+prev-BEV 状态和多帧对齐。
+
 ## 2. 导出 ONNX
 
 下面以 `CKPT` 指向当前要部署的 checkpoint。换 checkpoint 时，只需要更新
@@ -239,7 +244,12 @@ $TRT_PATH/bin/trtexec \
 `uniad_lidar` 会从 raw points 开始跑完整链路，并在多帧时把上一帧
 `bev_embed` 作为下一帧 `prev_bev`。第 0 帧会使用零 `prev_bev` 和
 `use_prev_bev=0`；metadata 里的 `prev_bev_exists=false` 会清空 C++ 侧
-prev-BEV 状态。
+prev-BEV 状态。使用 `--metadata-json` 时，runtime 还会读取
+`ego_motion_delta`，对上一帧 BEV 做与 Python `rotate_prev_bev_if_needed()`
+同语义的旋转对齐，并使用 metadata 推导 Dense-BEV 的 `shift`。
+
+下面命令里的 `1` 是 `num_frames`。多帧运行时把它改成实际帧数，并确保
+raw points 和 metadata 文件按 `000000`、`000001` 这样的序号连续存在。
 
 ### 5.1 不生成图片（生产/测速）
 
@@ -425,9 +435,12 @@ test_000000/current/raw_points_0.bin
 
 ## 8. 当前限制
 
-- 多帧时，C++ runtime 会传递上一帧 `bev_embed`，但还没有实现 Python 里的
-  `rotate_prev_bev_if_needed()`。如果要做严格多帧数值对齐，需要把这一步也
-  搬到 C++/CUDA 或导出进 runtime。
+- 严格多帧对齐依赖 `--metadata-json`。如果只提供 `--shift-dir` 而不提供
+  metadata，runtime 只能传递上一帧 `bev_embed` 和外部 shift，不会做
+  `ego_motion_delta` 驱动的 prev-BEV 旋转对齐。
+- 当前 `prev_bev` 对齐按 `base_bevformer_lidar.py` 的 BEV 配置实现：
+  batch size 1，point cloud XY 范围为 `[-64, -48]` 到 `[64, 48]`。如果修改
+  LiDAR 配置里的 BEV 范围，需要同步更新 runtime 的 BEV grid 配置。
 - TensorRT engine 和 TensorRT minor version 绑定很强。这里的 engine 以
   TensorRT 10.7 生成和验证，运行时也应使用 TensorRT 10.7 的库。
 - `bevformer_lidar_deploy_data` 是数据目录，可以复用；ONNX、engine、golden

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <algorithm>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -228,6 +229,34 @@ std::vector<float> load_shift_or_zero(
                     describe_candidates(candidates));
 }
 
+uniad_lidar::BevGridSpec bev_grid_from_dense_engine(
+    const std::shared_ptr<TensorRT::Engine>& engine) {
+  const std::vector<TRT_INT_TYPE> shape = engine->run_dims("prev_bev");
+  uniad_lidar::require(
+      shape.size() == 4,
+      "Dense engine prev_bev must be NCHW, got " +
+          uniad_lidar::shape_string_trt(shape));
+  for (TRT_INT_TYPE dim : shape) {
+    uniad_lidar::require(dim > 0,
+                         "Dense engine prev_bev has invalid dimension: " +
+                             uniad_lidar::shape_string_trt(shape));
+    uniad_lidar::require(
+        dim <= static_cast<TRT_INT_TYPE>(std::numeric_limits<int>::max()),
+        "Dense engine prev_bev dimension is too large: " +
+            uniad_lidar::shape_string_trt(shape));
+  }
+
+  uniad_lidar::BevGridSpec grid;
+  grid.batch_size = static_cast<int>(shape[0]);
+  grid.channels = static_cast<int>(shape[1]);
+  grid.height = static_cast<int>(shape[2]);
+  grid.width = static_cast<int>(shape[3]);
+  uniad_lidar::require(
+      grid.batch_size == 1,
+      "uniad_lidar currently supports batch size 1 for prev_bev alignment.");
+  return grid;
+}
+
 std::string resolve_metadata_path(
     const std::string& input, int frame, int num_frames) {
   if (has_frame_token(input)) {
@@ -409,6 +438,8 @@ int main(int argc, char** argv) {
       static_cast<size_t>(dense_engine->numel("shift"));
   const size_t use_prev_numel =
       static_cast<size_t>(dense_engine->numel("use_prev_bev"));
+  const uniad_lidar::BevGridSpec prev_bev_grid =
+      bev_grid_from_dense_engine(dense_engine);
   std::vector<float> prev_bev(prev_numel, 0.0f);
   bool prev_bev_valid = false;
   const std::vector<std::string> output_names = {
@@ -462,6 +493,12 @@ int main(int argc, char** argv) {
         prev_bev_valid = false;
         dense_input.prev_bev = prev_bev;
       }
+      bool prev_bev_aligned = false;
+      if (prev_bev_valid) {
+        dense_input.prev_bev = uniad_lidar::rotate_prev_bev_from_metadata(
+            prev_bev, metadata, prev_bev_grid);
+        prev_bev_aligned = metadata.has_ego_motion_delta;
+      }
       dense_input.shift = uniad_lidar::shift_from_metadata(metadata);
       uniad_lidar::require(
           dense_input.shift.size() == shift_numel,
@@ -470,10 +507,12 @@ int main(int argc, char** argv) {
           ? (metadata.prev_bev_exists ? "true" : "false")
           : "missing";
       std::printf("[INFO] frame %d metadata: %s, prev_bev_exists=%s, "
-                  "shift=(%.9g, %.9g), use_prev_bev=%d\n",
+                  "shift=(%.9g, %.9g), use_prev_bev=%d, "
+                  "prev_bev_aligned=%d\n",
                   frame, metadata_path.c_str(), prev_label,
                   dense_input.shift[0], dense_input.shift[1],
-                  prev_bev_valid ? 1 : 0);
+                  prev_bev_valid ? 1 : 0,
+                  prev_bev_aligned ? 1 : 0);
     } else {
       dense_input.shift = load_shift_or_zero(
           args.shift_dir, frame, shift_numel);
