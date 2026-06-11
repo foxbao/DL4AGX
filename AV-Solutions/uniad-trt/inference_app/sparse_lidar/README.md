@@ -45,8 +45,8 @@ export LD_LIBRARY_PATH=$TRT_PATH/lib:$LD_LIBRARY_PATH
 export TARGET_GPU_SM=89
 export SPCONV_CUDA_VERSION=11.4
 export UNIAD_TRAIN_DIR=$PWD/UniAD_train/UniAD
-# 改成当前要部署的 checkpoint，例如 epoch_2.pth、latest.pth 或 best.pth。
-export CKPT=$UNIAD_TRAIN_DIR/projects/work_dirs/bevformer_lidar/base_bevformer_lidar/epoch_2.pth
+# 默认使用 latest.pth；需要固定版本时可改成 epoch_*.pth 或 best.pth。
+export CKPT=$UNIAD_TRAIN_DIR/projects/work_dirs/bevformer_lidar/base_bevformer_lidar/latest.pth
 # README 默认跑 2 帧，用来覆盖 prev-BEV 多帧链路；只跑单帧时改成 1。
 export NUM_FRAMES=2
 ```
@@ -191,6 +191,12 @@ inference_app/enqueueV3/build/libuniad_plugin.so
 ```
 
 ### 3.2 编译 sparse_lidar runtime
+
+`sparse_lidar` 默认使用 repo 内置的
+`dependencies/3DSparseConvolution`。如果 `inference_app/sparse_lidar/build`
+之前已经用 `-DSPARSE_CONV_ROOT` 或 `-DLIDAR_AI_SOLUTION_PATH` 配置过，CMake
+会复用旧 cache；要切回 repo 内置依赖，先删除
+`inference_app/sparse_lidar/build/CMakeCache.txt` 或整个 build 目录后再配置。
 
 ```bash
 cmake -S inference_app/sparse_lidar -B inference_app/sparse_lidar/build \
