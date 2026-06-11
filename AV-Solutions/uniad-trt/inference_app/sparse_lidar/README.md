@@ -22,9 +22,8 @@ engine。只有 `backbone+neck` 和 `Dense-BEV head` 两段会生成 TensorRT en
 - `inference_app/enqueueV3`：TensorRT 10.x 的 plugin 工程，生成
   `libuniad_plugin.so`。
 - `inference_app/sparse_lidar`：LiDAR C++ runtime 和验证工具。
-- `3DSparseConvolution`：`libspconv` C++ runtime。推荐放在
-  `dependencies/3DSparseConvolution`；如果放在别处，用 `SPARSE_CONV_ROOT`
-  指向它。
+- `dependencies/3DSparseConvolution`：repo 内置的 `libspconv` C++ runtime
+  最小集合，`sparse_lidar` 默认会自动使用它。
 - `dumped_inputs/bevformer_lidar_deploy_data` 不带 `epoch`，因为它只是数据
   和 metadata，不依赖 checkpoint。
 - `*_epoch2.onnx`、`*_epoch2*.engine`、`raw_golden_epoch2` 保留 `epoch2`，
@@ -43,18 +42,16 @@ export PATH=$TRT_PATH/bin:$PATH
 export LD_LIBRARY_PATH=$TRT_PATH/lib:$LD_LIBRARY_PATH
 
 export TARGET_GPU_SM=89
-export SPARSE_CONV_ROOT=/home/baojiali/Downloads/public_code/Lidar_AI_Solution/libraries/3DSparseConvolution
 export SPCONV_CUDA_VERSION=11.4
 ```
 
 这里不设置 `CUDA_VISIBLE_DEVICES`。如果要换 GPU，用系统默认 CUDA 选择方式
 或在外层运行环境里处理。
 
-`SPARSE_CONV_ROOT` 是当前机器上的路径。为了更稳妥，建议后续把
-`3DSparseConvolution` 作为 repo 内依赖放到 `dependencies/3DSparseConvolution`
-或用 git submodule 固定版本；这样 CMake 可以自动找到它，不需要引用另一棵
-本地工程。旧的 `-DLIDAR_AI_SOLUTION_PATH=/path/to/Lidar_AI_Solution` 仍然兼容，
-但不推荐作为长期命令。
+如果需要使用别处的 `3DSparseConvolution`，可以额外传
+`-DSPARSE_CONV_ROOT=/path/to/3DSparseConvolution`。旧的
+`-DLIDAR_AI_SOLUTION_PATH=/path/to/Lidar_AI_Solution` 仍然兼容，但不推荐作为
+长期命令。
 
 ## 1. 准备部署输入数据
 
@@ -182,7 +179,6 @@ inference_app/enqueueV3/build_trt107/libuniad_plugin.so
 
 ```bash
 cmake -S inference_app/sparse_lidar -B inference_app/sparse_lidar/build \
-  -DSPARSE_CONV_ROOT=$SPARSE_CONV_ROOT \
   -DSPCONV_CUDA_VERSION=$SPCONV_CUDA_VERSION \
   -DTENSORRT_PATH=$TRT_PATH
 
