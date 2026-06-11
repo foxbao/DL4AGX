@@ -206,12 +206,16 @@ inference_app/sparse_lidar/build/uniad_lidar
 mkdir -p UniAD/engine
 ```
 
+TensorRT engine 和 TensorRT minor version、GPU 架构有关。README 默认使用稳定
+文件名并覆盖旧 engine；如果要同时保留多套环境，可以手动加 tag，例如
+`_trt10.7_sm89`。
+
 ### 4.1 Backbone+Neck Engine
 
 ```bash
 $TRT_PATH/bin/trtexec \
   --onnx=UniAD_train/UniAD/onnx/bevformer_lidar_backbone_neck.onnx \
-  --saveEngine=UniAD/engine/bevformer_lidar_backbone_neck_trt10.7_sm89.engine \
+  --saveEngine=UniAD/engine/bevformer_lidar_backbone_neck.engine \
   --fp16 \
   --skipInference
 ```
@@ -224,7 +228,7 @@ Dense-BEV ONNX 里有 TensorRT plugin op，所以编译时要加载
 ```bash
 $TRT_PATH/bin/trtexec \
   --onnx=UniAD/onnx/bevformer_lidar_bev_trt.repaired.onnx \
-  --saveEngine=UniAD/engine/bevformer_lidar_bev_head_trt10.7_sm89.engine \
+  --saveEngine=UniAD/engine/bevformer_lidar_bev_head.engine \
   --staticPlugins=inference_app/enqueueV3/build/libuniad_plugin.so \
   --fp16 \
   --skipInference
@@ -240,8 +244,8 @@ prev-BEV 状态。
 ```bash
 ./inference_app/sparse_lidar/build/uniad_lidar \
   UniAD_train/UniAD/onnx/bevformer_lidar_sparse_encoder.onnx \
-  UniAD/engine/bevformer_lidar_backbone_neck_trt10.7_sm89.engine \
-  UniAD/engine/bevformer_lidar_bev_head_trt10.7_sm89.engine \
+  UniAD/engine/bevformer_lidar_backbone_neck.engine \
+  UniAD/engine/bevformer_lidar_bev_head.engine \
   inference_app/enqueueV3/build/libuniad_plugin.so \
   UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data \
   inference_app/sparse_lidar/build/uniad_lidar_deploy_data \
@@ -325,8 +329,8 @@ SPARSE_LIDAR_VERBOSE=1 ./inference_app/sparse_lidar/build/validate_sparse ...
   UniAD_train/UniAD/onnx/bevformer_lidar_sparse_encoder.onnx \
   --raw-points \
   UniAD_train/UniAD/dumped_inputs/bevformer_lidar_raw_golden/test_000000/current/raw_points_0.bin \
-  UniAD/engine/bevformer_lidar_backbone_neck_trt10.7_sm89.engine \
-  UniAD/engine/bevformer_lidar_bev_head_trt10.7_sm89.engine \
+  UniAD/engine/bevformer_lidar_backbone_neck.engine \
+  UniAD/engine/bevformer_lidar_bev_head.engine \
   inference_app/enqueueV3/build/libuniad_plugin.so \
   UniAD_train/UniAD/dumped_inputs/bevformer_lidar_raw_golden/test_000000 \
   inference_app/sparse_lidar/build/raw_points_frontend_dense_trt \
