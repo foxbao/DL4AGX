@@ -81,6 +81,7 @@ add_executable(validate_sparse
 )
 
 set(SPARSE_RUNTIME_INCLUDES
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${GENERATED_PROTO_ROOT}
   ${SPARSE_CONV_ROOT}/src
   ${SPARSE_CONV_ROOT}/libspconv/include
@@ -121,27 +122,43 @@ if(TENSORRT_PATH)
   endif()
 
   set(ENQUEUE_V3_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../enqueueV3)
-  add_executable(validate_sparse_trt
-    src/validate_sparse_trt.cpp
+  add_library(sparse_lidar_trt_runtime STATIC
+    src/lidar_runtime.cpp
+    src/lidar_postprocess.cpp
+    src/lidar_bev_visualizer.cpp
+    src/lidar_metadata.cpp
     ${GENERATED_PROTO_ROOT}/onnx-parser.cpp
     ${GENERATED_PROTO_SRCS}
     ${ENQUEUE_V3_ROOT}/src/tensorrt.cpp
   )
-  target_include_directories(validate_sparse_trt PRIVATE
+  target_include_directories(sparse_lidar_trt_runtime PUBLIC
     ${SPARSE_RUNTIME_INCLUDES}
     ${ENQUEUE_V3_ROOT}/include
     ${TENSORRT_INCLUDE_DIRS}
   )
-  target_link_directories(validate_sparse_trt PRIVATE
+  target_link_directories(sparse_lidar_trt_runtime PUBLIC
     ${SPARSE_RUNTIME_LIB_DIRS}
     ${TENSORRT_LIBRARY_DIRS}
   )
-  target_link_libraries(validate_sparse_trt PRIVATE
+  target_link_libraries(sparse_lidar_trt_runtime PUBLIC
     ${SPARSE_RUNTIME_LIBS}
     ${NVINFER_LIBRARY}
     ${NVINFER_PLUGIN_LIBRARY}
   )
+
+  add_executable(validate_sparse_trt
+    src/validate_sparse_trt.cpp
+  )
+  target_link_libraries(validate_sparse_trt PRIVATE sparse_lidar_trt_runtime)
+  add_executable(uniad_lidar
+    src/uniad_lidar.cpp
+  )
+  target_link_libraries(uniad_lidar PRIVATE sparse_lidar_trt_runtime)
   set_target_properties(validate_sparse_trt PROPERTIES
+    BUILD_RPATH "${SPCONV_LIB_DIR};${CUDA_LIBRARY_DIRS};${TENSORRT_LIBRARY_DIRS}"
+    INSTALL_RPATH "${SPCONV_LIB_DIR};${CUDA_LIBRARY_DIRS};${TENSORRT_LIBRARY_DIRS}"
+  )
+  set_target_properties(uniad_lidar PROPERTIES
     BUILD_RPATH "${SPCONV_LIB_DIR};${CUDA_LIBRARY_DIRS};${TENSORRT_LIBRARY_DIRS}"
     INSTALL_RPATH "${SPCONV_LIB_DIR};${CUDA_LIBRARY_DIRS};${TENSORRT_LIBRARY_DIRS}"
   )
