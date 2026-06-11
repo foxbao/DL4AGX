@@ -241,6 +241,10 @@ $TRT_PATH/bin/trtexec \
 `use_prev_bev=0`；metadata 里的 `prev_bev_exists=false` 会清空 C++ 侧
 prev-BEV 状态。
 
+### 5.1 不生成图片（生产/测速）
+
+这条命令只写 tensor dump 和 `detections.txt`，不写 SVG 图片：
+
 ```bash
 ./inference_app/sparse_lidar/build/uniad_lidar \
   UniAD_train/UniAD/onnx/bevformer_lidar_sparse_encoder.onnx \
@@ -253,16 +257,28 @@ prev-BEV 状态。
   41 960 1280 \
   --metadata-json UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data \
   --score-threshold 0.05 \
-  --bev-score-threshold 0.05
+  --no-visualization
 ```
 
-上面这条命令会生成单独的部署推理可视化：
+输出文件按 frame 前缀写入：
+
+```text
+frame_000000_lidar_bev.bin
+frame_000000_bev_embed.bin
+frame_000000_all_cls_scores.bin
+frame_000000_all_bbox_preds.bin
+frame_000000_detections.txt
+```
+
+### 5.2 生成图片（检查结果）
+
+把 `--no-visualization` 去掉，就会额外生成单独的部署推理可视化：
 
 ```text
 frame_000000_bev.svg          # 只画 TensorRT prediction
 ```
 
-如果需要 GT / prediction 左右对比图，再加：
+如果还需要 GT / prediction 左右对比图，再加：
 
 ```bash
 --gt-detections UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data
@@ -277,14 +293,9 @@ frame_000000_bev_compare.svg  # 左边 GT，右边 TensorRT prediction
 这两种图都来自部署侧 C++ runtime，不需要 PyTorch。PyTorch BEV 可视化在
 第 6.4 节，是单独用来查看 PyTorch 模型输出的辅助工具。
 
-输出文件按 frame 前缀写入：
+生成图片时，输出文件会多出：
 
 ```text
-frame_000000_lidar_bev.bin
-frame_000000_bev_embed.bin
-frame_000000_all_cls_scores.bin
-frame_000000_all_bbox_preds.bin
-frame_000000_detections.txt
 frame_000000_bev.svg
 frame_000000_bev_compare.svg    # 只有传了 --gt-detections 才会生成
 ```

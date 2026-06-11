@@ -41,6 +41,7 @@ struct CliArgs {
   std::string shift_dir;
   std::string metadata_input;
   std::string gt_detections_input;
+  bool write_visualization = true;
   uniad_lidar::DetectionDecodeConfig decode_config;
   uniad_lidar::BevVisualizationConfig bev_visualization_config;
 };
@@ -54,7 +55,8 @@ void usage(const char* program) {
       "[--metadata-json <file_or_dir_or_pattern>] "
       "[--gt-detections <file_or_dir_or_pattern>] "
       "[--score-threshold <score>] [--max-dets <count>] "
-      "[--bev-max-draw <count>] [--bev-score-threshold <score>]\n",
+      "[--bev-max-draw <count>] [--bev-score-threshold <score>] "
+      "[--no-visualization]\n",
       program);
   std::fprintf(
       stderr,
@@ -353,6 +355,8 @@ CliArgs parse_cli(int argc, char** argv) {
       uniad_lidar::require(cursor < argc,
                            "--gt-detections requires a value.");
       args.gt_detections_input = argv[cursor++];
+    } else if (option == "--no-visualization") {
+      args.write_visualization = false;
     } else if (option == "--score-threshold") {
       uniad_lidar::require(cursor < argc,
                            "--score-threshold requires a value.");
@@ -415,6 +419,10 @@ int main(int argc, char** argv) {
                 "takes precedence over --shift-dir.\n");
   } else if (args.shift_dir.empty() && args.metadata_input.empty()) {
     std::printf("[WARN] --shift-dir not provided; using zero shift for all frames.\n");
+  }
+  if (!args.write_visualization && !args.gt_detections_input.empty()) {
+    std::printf("[INFO] --no-visualization provided; "
+                "--gt-detections will not produce comparison SVGs.\n");
   }
 
   for (int frame = 0; frame < args.num_frames; ++frame) {
@@ -497,10 +505,12 @@ int main(int argc, char** argv) {
             args.decode_config);
     uniad_lidar::write_detections_txt(prefix + "_detections.txt",
                                       detections);
-    uniad_lidar::write_bev_svg(prefix + "_bev.svg",
-                               detections,
-                               args.bev_visualization_config);
-    if (!args.gt_detections_input.empty()) {
+    if (args.write_visualization) {
+      uniad_lidar::write_bev_svg(prefix + "_bev.svg",
+                                 detections,
+                                 args.bev_visualization_config);
+    }
+    if (args.write_visualization && !args.gt_detections_input.empty()) {
       const std::string gt_path = resolve_gt_detections_path(
           args.gt_detections_input, frame, args.num_frames);
       const std::vector<uniad_lidar::Detection> gt_detections =
