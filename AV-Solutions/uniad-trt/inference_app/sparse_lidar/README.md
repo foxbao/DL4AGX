@@ -47,6 +47,8 @@ export SPCONV_CUDA_VERSION=11.4
 export UNIAD_TRAIN_DIR=$PWD/UniAD_train/UniAD
 # 改成当前要部署的 checkpoint，例如 epoch_2.pth、latest.pth 或 best.pth。
 export CKPT=$UNIAD_TRAIN_DIR/projects/work_dirs/bevformer_lidar/base_bevformer_lidar/epoch_2.pth
+# README 默认跑 2 帧，用来覆盖 prev-BEV 多帧链路；只跑单帧时改成 1。
+export NUM_FRAMES=2
 ```
 
 这里不设置 `CUDA_VISIBLE_DEVICES`。如果要换 GPU，用系统默认 CUDA 选择方式
@@ -69,7 +71,7 @@ python tools/prepare_bevformer_lidar_deploy_data.py \
   --config projects/configs/bevformer_lidar/base_bevformer_lidar.py \
   --split test \
   --start-index 0 \
-  --max-frames 1 \
+  --max-frames $NUM_FRAMES \
   --out-dir dumped_inputs/bevformer_lidar_deploy_data
 
 cd -
@@ -78,19 +80,22 @@ cd -
 输出目录示例：
 
 ```text
-raw_points_000000.bin       # float32 Nx4，部署输入
-raw_points_000000.npy       # 同一份点云，方便 debug
-img_metas_000000.json       # Dense-BEV shift / prev_bev_exists metadata
-gt_detections_000000.txt    # 可选，用于左右对比图
-manifest.json               # config、split、token、scene、文件列表
+raw_points_000000.bin          # 第 0 帧 float32 Nx4，部署输入
+raw_points_000001.bin          # 第 1 帧；后续帧按序号递增
+raw_points_000000.npy          # 同一份点云，方便 debug
+img_metas_000000.json          # Dense-BEV shift / prev_bev_exists metadata
+img_metas_000001.json
+gt_detections_000000.txt       # 可选，用于左右对比图
+gt_detections_000001.txt
+manifest.json                  # config、split、token、scene、文件列表
 ```
 
 如果只需要纯部署输入，不需要画 GT 对比，加 `--no-gt`。
 
-多帧部署时，把 `--max-frames` 改成需要的帧数即可。脚本会连续写
-`raw_points_000000.bin`、`img_metas_000000.json` 等文件；metadata 里的
-`prev_bev_exists` 和 `ego_motion_delta` 会被 C++ runtime 用来处理
-prev-BEV 状态和多帧对齐。
+脚本会从 `--start-index` 开始，在同一个 scene 内连续取最多 `NUM_FRAMES`
+帧。实际写出的帧数记录在 `manifest.json` 的 `num_frames`，后面运行
+`uniad_lidar` 时传入的帧数要和这里一致。metadata 里的 `prev_bev_exists`
+和 `ego_motion_delta` 会被 C++ runtime 用来处理 prev-BEV 状态和多帧对齐。
 
 ## 2. 导出 ONNX
 
@@ -248,8 +253,9 @@ prev-BEV 状态。使用 `--metadata-json` 时，runtime 还会读取
 `ego_motion_delta`，对上一帧 BEV 做与 Python `rotate_prev_bev_if_needed()`
 同语义的旋转对齐，并使用 metadata 推导 Dense-BEV 的 `shift`。
 
-下面命令里的 `1` 是 `num_frames`。多帧运行时把它改成实际帧数，并确保
-raw points 和 metadata 文件按 `000000`、`000001` 这样的序号连续存在。
+下面命令使用 `NUM_FRAMES`，它要和第 1 步生成的 `manifest.json` 里的
+`num_frames` 一致。raw points 和 metadata 文件需要按 `000000`、`000001`
+这样的序号连续存在。
 
 ### 5.1 不生成图片（生产/测速）
 
@@ -263,7 +269,7 @@ raw points 和 metadata 文件按 `000000`、`000001` 这样的序号连续存�
   inference_app/enqueueV3/build/libuniad_plugin.so \
   UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data \
   inference_app/sparse_lidar/build/uniad_lidar_deploy_data \
-  1 \
+  $NUM_FRAMES \
   41 960 1280 \
   --metadata-json UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data \
   --score-threshold 0.05 \
@@ -278,6 +284,11 @@ frame_000000_bev_embed.bin
 frame_000000_all_cls_scores.bin
 frame_000000_all_bbox_preds.bin
 frame_000000_detections.txt
+frame_000001_lidar_bev.bin
+frame_000001_bev_embed.bin
+frame_000001_all_cls_scores.bin
+frame_000001_all_bbox_preds.bin
+frame_000001_detections.txt
 ```
 
 ### 5.2 生成图片（检查结果）
@@ -285,7 +296,7 @@ frame_000000_detections.txt
 把 `--no-visualization` 去掉，就会额外生成单独的部署推理可视化：
 
 ```text
-frame_000000_bev.svg          # 只画 TensorRT prediction
+frame_XXXXXX_bev.svg          # 只画 TensorRT prediction
 ```
 
 如果还需要 GT / prediction 左右对比图，再加：
@@ -297,7 +308,7 @@ frame_000000_bev.svg          # 只画 TensorRT prediction
 这样会额外生成：
 
 ```text
-frame_000000_bev_compare.svg  # 左边 GT，右边 TensorRT prediction
+frame_XXXXXX_bev_compare.svg  # 左边 GT，右边 TensorRT prediction
 ```
 
 这两种图都来自部署侧 C++ runtime，不需要 PyTorch。PyTorch BEV 可视化在
@@ -306,8 +317,8 @@ frame_000000_bev_compare.svg  # 左边 GT，右边 TensorRT prediction
 生成图片时，输出文件会多出：
 
 ```text
-frame_000000_bev.svg
-frame_000000_bev_compare.svg    # 只有传了 --gt-detections 才会生成
+frame_XXXXXX_bev.svg
+frame_XXXXXX_bev_compare.svg    # 只有传了 --gt-detections 才会生成
 ```
 
 `frame_XXXXXX_detections.txt` 的 decode 逻辑对齐 `NMSFreeCoder`：取最后一层
@@ -398,7 +409,7 @@ python tools/visualize_bevformer_lidar_pytorch.py \
   --checkpoint $CKPT \
   --split test \
   --start-index 0 \
-  --max-frames 1 \
+  --max-frames $NUM_FRAMES \
   --score-thr 0.05 \
   --out-dir projects/work_dirs/vis_bevformer_lidar_pytorch \
   --annotate
@@ -431,7 +442,7 @@ test_000000/current/raw_points_0.bin
 
 `--metadata-json` 和 `--gt-detections` 也支持单文件、目录或 pattern。当前
 `prepare_bevformer_lidar_deploy_data.py` 生成的
-`img_metas_000000.json`、`gt_detections_000000.txt` 可以被 runtime 直接识别。
+`img_metas_XXXXXX.json`、`gt_detections_XXXXXX.txt` 可以被 runtime 直接识别。
 
 ## 8. 当前限制
 
