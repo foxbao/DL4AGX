@@ -26,8 +26,9 @@ engine。只有 `backbone+neck` 和 `Dense-BEV head` 两段会生成 TensorRT en
   最小集合，`sparse_lidar` 默认会自动使用它。
 - `dumped_inputs/bevformer_lidar_deploy_data` 不带 `epoch`，因为它只是数据
   和 metadata，不依赖 checkpoint。
-- `*_epoch2.onnx`、`*_epoch2*.engine`、`raw_golden_epoch2` 保留 `epoch2`，
-  因为它们和 `epoch_2.pth` 权重绑定。
+- README 默认使用稳定产物名，例如 `bevformer_lidar_sparse_encoder.onnx`、
+  `bevformer_lidar_backbone_neck.engine`。如果要同时保留多个 checkpoint 的
+  产物，可以手动在文件名后加 tag，例如 `_best_20260611` 或 `_run042`。
 
 ## 0. 环境
 
@@ -43,6 +44,9 @@ export LD_LIBRARY_PATH=$TRT_PATH/lib:$LD_LIBRARY_PATH
 
 export TARGET_GPU_SM=89
 export SPCONV_CUDA_VERSION=11.4
+export UNIAD_TRAIN_DIR=$PWD/UniAD_train/UniAD
+# 改成当前要部署的 checkpoint，例如 epoch_2.pth、latest.pth 或 best.pth。
+export CKPT=$UNIAD_TRAIN_DIR/projects/work_dirs/bevformer_lidar/base_bevformer_lidar/epoch_2.pth
 ```
 
 这里不设置 `CUDA_VISIBLE_DEVICES`。如果要换 GPU，用系统默认 CUDA 选择方式
@@ -85,7 +89,8 @@ manifest.json               # config、split、token、scene、文件列表
 
 ## 2. 导出 ONNX
 
-下面以 `epoch_2.pth` 为例。换 checkpoint 时，更新 checkpoint 路径和输出文件名。
+下面以 `CKPT` 指向当前要部署的 checkpoint。换 checkpoint 时，只需要更新
+`CKPT`；如果不需要保留旧产物，ONNX 和 engine 文件名可以保持不变并覆盖。
 
 ### 2.1 Sparse Encoder ONNX
 
@@ -94,11 +99,11 @@ cd UniAD_train/UniAD
 
 python tools/export_bevformer_lidar_sparse_onnx.py \
   projects/configs/bevformer_lidar/base_bevformer_lidar.py \
-  projects/work_dirs/bevformer_lidar/base_bevformer_lidar/epoch_2.pth \
+  $CKPT \
   --split test \
   --index 0 \
-  --onnx-file onnx/bevformer_lidar_sparse_encoder_epoch2.onnx \
-  --tensor-prefix dumped_inputs/bevformer_lidar_sparse_encoder_epoch2/infer
+  --onnx-file onnx/bevformer_lidar_sparse_encoder.onnx \
+  --tensor-prefix dumped_inputs/bevformer_lidar_sparse_encoder/infer
 
 cd -
 ```
@@ -106,10 +111,10 @@ cd -
 这一步会生成：
 
 ```text
-UniAD_train/UniAD/onnx/bevformer_lidar_sparse_encoder_epoch2.onnx
-UniAD_train/UniAD/dumped_inputs/bevformer_lidar_sparse_encoder_epoch2/infer.voxels
-UniAD_train/UniAD/dumped_inputs/bevformer_lidar_sparse_encoder_epoch2/infer.coors
-UniAD_train/UniAD/dumped_inputs/bevformer_lidar_sparse_encoder_epoch2/infer.dense
+UniAD_train/UniAD/onnx/bevformer_lidar_sparse_encoder.onnx
+UniAD_train/UniAD/dumped_inputs/bevformer_lidar_sparse_encoder/infer.voxels
+UniAD_train/UniAD/dumped_inputs/bevformer_lidar_sparse_encoder/infer.coors
+UniAD_train/UniAD/dumped_inputs/bevformer_lidar_sparse_encoder/infer.dense
 ```
 
 `infer.*` 主要用于验证 sparse ONNX，本身不是正式部署输入数据。
@@ -121,8 +126,8 @@ cd UniAD_train/UniAD
 
 python tools/export_bevformer_lidar_backbone_neck_onnx.py \
   projects/configs/bevformer_lidar/base_bevformer_lidar.py \
-  projects/work_dirs/bevformer_lidar/base_bevformer_lidar/epoch_2.pth \
-  --onnx-file onnx/bevformer_lidar_backbone_neck_epoch2.onnx
+  $CKPT \
+  --onnx-file onnx/bevformer_lidar_backbone_neck.onnx
 
 cd -
 ```
@@ -130,7 +135,7 @@ cd -
 如果已经 dump 了 PyTorch golden，并且想在导出时顺手比较，可额外加：
 
 ```bash
---golden-dir dumped_inputs/bevformer_lidar_raw_golden_epoch2/test_000000
+--golden-dir dumped_inputs/bevformer_lidar_raw_golden/test_000000
 ```
 
 ### 2.3 Dense-BEV Head ONNX
@@ -144,8 +149,8 @@ cd UniAD
 
 python tools/export_bevformer_lidar_onnx.py \
   projects/configs/bevformer_lidar/base_bevformer_lidar_trt_p.py \
-  ../UniAD_train/UniAD/projects/work_dirs/bevformer_lidar/base_bevformer_lidar/epoch_2.pth \
-  --onnx-file onnx/bevformer_lidar_bev_trt_epoch2.onnx
+  $CKPT \
+  --onnx-file onnx/bevformer_lidar_bev_trt.onnx
 
 cd -
 ```
@@ -153,8 +158,8 @@ cd -
 输出：
 
 ```text
-UniAD/onnx/bevformer_lidar_bev_trt_epoch2.onnx
-UniAD/onnx/bevformer_lidar_bev_trt_epoch2.repaired.onnx
+UniAD/onnx/bevformer_lidar_bev_trt.onnx
+UniAD/onnx/bevformer_lidar_bev_trt.repaired.onnx
 ```
 
 ## 3. 编译 C++ 和 TensorRT Plugin
@@ -205,8 +210,8 @@ mkdir -p UniAD/engine
 
 ```bash
 $TRT_PATH/bin/trtexec \
-  --onnx=UniAD_train/UniAD/onnx/bevformer_lidar_backbone_neck_epoch2.onnx \
-  --saveEngine=UniAD/engine/bevformer_lidar_backbone_neck_epoch2_trt10.7_sm89.engine \
+  --onnx=UniAD_train/UniAD/onnx/bevformer_lidar_backbone_neck.onnx \
+  --saveEngine=UniAD/engine/bevformer_lidar_backbone_neck_trt10.7_sm89.engine \
   --fp16 \
   --skipInference
 ```
@@ -218,8 +223,8 @@ Dense-BEV ONNX 里有 TensorRT plugin op，所以编译时要加载
 
 ```bash
 $TRT_PATH/bin/trtexec \
-  --onnx=UniAD/onnx/bevformer_lidar_bev_trt_epoch2.repaired.onnx \
-  --saveEngine=UniAD/engine/bevformer_lidar_bev_trt_epoch2_trt10.7_sm89.engine \
+  --onnx=UniAD/onnx/bevformer_lidar_bev_trt.repaired.onnx \
+  --saveEngine=UniAD/engine/bevformer_lidar_bev_head_trt10.7_sm89.engine \
   --staticPlugins=inference_app/enqueueV3/build_trt107/libuniad_plugin.so \
   --fp16 \
   --skipInference
@@ -234,12 +239,12 @@ prev-BEV 状态。
 
 ```bash
 ./inference_app/sparse_lidar/build/uniad_lidar \
-  UniAD_train/UniAD/onnx/bevformer_lidar_sparse_encoder_epoch2.onnx \
-  UniAD/engine/bevformer_lidar_backbone_neck_epoch2_trt10.7_sm89.engine \
-  UniAD/engine/bevformer_lidar_bev_trt_epoch2_trt10.7_sm89.engine \
+  UniAD_train/UniAD/onnx/bevformer_lidar_sparse_encoder.onnx \
+  UniAD/engine/bevformer_lidar_backbone_neck_trt10.7_sm89.engine \
+  UniAD/engine/bevformer_lidar_bev_head_trt10.7_sm89.engine \
   inference_app/enqueueV3/build_trt107/libuniad_plugin.so \
   UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data \
-  inference_app/sparse_lidar/build/uniad_lidar_epoch2_deploy_data \
+  inference_app/sparse_lidar/build/uniad_lidar_deploy_data \
   1 \
   41 960 1280 \
   --metadata-json UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data \
@@ -287,10 +292,10 @@ cd UniAD_train/UniAD
 
 python tools/dump_bevformer_lidar_golden.py \
   projects/configs/bevformer_lidar/base_bevformer_lidar.py \
-  projects/work_dirs/bevformer_lidar/base_bevformer_lidar/epoch_2.pth \
+  $CKPT \
   --split test \
   --index 0 \
-  --out-dir dumped_inputs/bevformer_lidar_raw_golden_epoch2
+  --out-dir dumped_inputs/bevformer_lidar_raw_golden
 
 cd -
 ```
@@ -299,11 +304,11 @@ cd -
 
 ```bash
 ./inference_app/sparse_lidar/build/validate_sparse \
-  UniAD_train/UniAD/onnx/bevformer_lidar_sparse_encoder_epoch2.onnx \
-  UniAD_train/UniAD/dumped_inputs/bevformer_lidar_sparse_encoder_epoch2/infer.voxels \
-  UniAD_train/UniAD/dumped_inputs/bevformer_lidar_sparse_encoder_epoch2/infer.coors \
+  UniAD_train/UniAD/onnx/bevformer_lidar_sparse_encoder.onnx \
+  UniAD_train/UniAD/dumped_inputs/bevformer_lidar_sparse_encoder/infer.voxels \
+  UniAD_train/UniAD/dumped_inputs/bevformer_lidar_sparse_encoder/infer.coors \
   inference_app/sparse_lidar/build/bevformer_lidar_sparse_output.dense \
-  UniAD_train/UniAD/dumped_inputs/bevformer_lidar_sparse_encoder_epoch2/infer.dense \
+  UniAD_train/UniAD/dumped_inputs/bevformer_lidar_sparse_encoder/infer.dense \
   41 960 1280
 ```
 
@@ -317,14 +322,14 @@ SPARSE_LIDAR_VERBOSE=1 ./inference_app/sparse_lidar/build/validate_sparse ...
 
 ```bash
 ./inference_app/sparse_lidar/build/validate_sparse_trt \
-  UniAD_train/UniAD/onnx/bevformer_lidar_sparse_encoder_epoch2.onnx \
+  UniAD_train/UniAD/onnx/bevformer_lidar_sparse_encoder.onnx \
   --raw-points \
-  UniAD_train/UniAD/dumped_inputs/bevformer_lidar_raw_golden_epoch2/test_000000/current/raw_points_0.bin \
-  UniAD/engine/bevformer_lidar_backbone_neck_epoch2_trt10.7_sm89.engine \
-  UniAD/engine/bevformer_lidar_bev_trt_epoch2_trt10.7_sm89.engine \
+  UniAD_train/UniAD/dumped_inputs/bevformer_lidar_raw_golden/test_000000/current/raw_points_0.bin \
+  UniAD/engine/bevformer_lidar_backbone_neck_trt10.7_sm89.engine \
+  UniAD/engine/bevformer_lidar_bev_head_trt10.7_sm89.engine \
   inference_app/enqueueV3/build_trt107/libuniad_plugin.so \
-  UniAD_train/UniAD/dumped_inputs/bevformer_lidar_raw_golden_epoch2/test_000000 \
-  inference_app/sparse_lidar/build/raw_points_frontend_dense_trt_epoch2 \
+  UniAD_train/UniAD/dumped_inputs/bevformer_lidar_raw_golden/test_000000 \
+  inference_app/sparse_lidar/build/raw_points_frontend_dense_trt \
   41 960 1280
 ```
 
@@ -347,12 +352,12 @@ cd UniAD_train/UniAD
 
 python tools/visualize_bevformer_lidar_pytorch.py \
   --config projects/configs/bevformer_lidar/base_bevformer_lidar.py \
-  --checkpoint projects/work_dirs/bevformer_lidar/base_bevformer_lidar/epoch_2.pth \
+  --checkpoint $CKPT \
   --split test \
   --start-index 0 \
   --max-frames 1 \
   --score-thr 0.05 \
-  --out-dir projects/work_dirs/vis_bevformer_lidar_pytorch_epoch2 \
+  --out-dir projects/work_dirs/vis_bevformer_lidar_pytorch \
   --annotate
 
 cd -
