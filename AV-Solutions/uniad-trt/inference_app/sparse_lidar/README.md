@@ -167,17 +167,17 @@ UniAD/onnx/bevformer_lidar_bev_trt.repaired.onnx
 ### 3.1 编译 TensorRT plugin
 
 ```bash
-cmake -S inference_app/enqueueV3 -B inference_app/enqueueV3/build_trt107 \
+cmake -S inference_app/enqueueV3 -B inference_app/enqueueV3/build \
   -DTENSORRT_PATH=$TRT_PATH \
   -DTARGET_GPU_SM=$TARGET_GPU_SM
 
-cmake --build inference_app/enqueueV3/build_trt107 -j$(nproc)
+cmake --build inference_app/enqueueV3/build -j$(nproc)
 ```
 
 输出：
 
 ```text
-inference_app/enqueueV3/build_trt107/libuniad_plugin.so
+inference_app/enqueueV3/build/libuniad_plugin.so
 ```
 
 ### 3.2 编译 sparse_lidar runtime
@@ -225,7 +225,7 @@ Dense-BEV ONNX 里有 TensorRT plugin op，所以编译时要加载
 $TRT_PATH/bin/trtexec \
   --onnx=UniAD/onnx/bevformer_lidar_bev_trt.repaired.onnx \
   --saveEngine=UniAD/engine/bevformer_lidar_bev_head_trt10.7_sm89.engine \
-  --staticPlugins=inference_app/enqueueV3/build_trt107/libuniad_plugin.so \
+  --staticPlugins=inference_app/enqueueV3/build/libuniad_plugin.so \
   --fp16 \
   --skipInference
 ```
@@ -242,7 +242,7 @@ prev-BEV 状态。
   UniAD_train/UniAD/onnx/bevformer_lidar_sparse_encoder.onnx \
   UniAD/engine/bevformer_lidar_backbone_neck_trt10.7_sm89.engine \
   UniAD/engine/bevformer_lidar_bev_head_trt10.7_sm89.engine \
-  inference_app/enqueueV3/build_trt107/libuniad_plugin.so \
+  inference_app/enqueueV3/build/libuniad_plugin.so \
   UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data \
   inference_app/sparse_lidar/build/uniad_lidar_deploy_data \
   1 \
@@ -327,7 +327,7 @@ SPARSE_LIDAR_VERBOSE=1 ./inference_app/sparse_lidar/build/validate_sparse ...
   UniAD_train/UniAD/dumped_inputs/bevformer_lidar_raw_golden/test_000000/current/raw_points_0.bin \
   UniAD/engine/bevformer_lidar_backbone_neck_trt10.7_sm89.engine \
   UniAD/engine/bevformer_lidar_bev_head_trt10.7_sm89.engine \
-  inference_app/enqueueV3/build_trt107/libuniad_plugin.so \
+  inference_app/enqueueV3/build/libuniad_plugin.so \
   UniAD_train/UniAD/dumped_inputs/bevformer_lidar_raw_golden/test_000000 \
   inference_app/sparse_lidar/build/raw_points_frontend_dense_trt \
   41 960 1280
