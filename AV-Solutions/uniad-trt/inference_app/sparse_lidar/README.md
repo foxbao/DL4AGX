@@ -252,12 +252,30 @@ prev-BEV 状态。
   1 \
   41 960 1280 \
   --metadata-json UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data \
-  --gt-detections UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data \
   --score-threshold 0.05 \
   --bev-score-threshold 0.05
 ```
 
-如果不需要 GT / prediction 左右对比图，去掉 `--gt-detections`。
+上面这条命令会生成单独的部署推理可视化：
+
+```text
+frame_000000_bev.svg          # 只画 TensorRT prediction
+```
+
+如果需要 GT / prediction 左右对比图，再加：
+
+```bash
+--gt-detections UniAD_train/UniAD/dumped_inputs/bevformer_lidar_deploy_data
+```
+
+这样会额外生成：
+
+```text
+frame_000000_bev_compare.svg  # 左边 GT，右边 TensorRT prediction
+```
+
+这两种图都来自部署侧 C++ runtime，不需要 PyTorch。PyTorch BEV 可视化在
+第 6.4 节，是单独用来查看 PyTorch 模型输出的辅助工具。
 
 输出文件按 frame 前缀写入：
 
