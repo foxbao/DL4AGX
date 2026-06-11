@@ -5,18 +5,31 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_BUILD_TYPE Release)
 
-if(NOT LIDAR_AI_SOLUTION_PATH)
-  message(FATAL_ERROR "Need: -DLIDAR_AI_SOLUTION_PATH=/path/to/Lidar_AI_Solution")
+set(DEFAULT_SPARSE_CONV_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../dependencies/3DSparseConvolution)
+if(NOT SPARSE_CONV_ROOT)
+  if(DEFINED ENV{SPARSE_CONV_ROOT})
+    set(SPARSE_CONV_ROOT $ENV{SPARSE_CONV_ROOT})
+  elseif(EXISTS ${DEFAULT_SPARSE_CONV_ROOT})
+    set(SPARSE_CONV_ROOT ${DEFAULT_SPARSE_CONV_ROOT})
+  elseif(LIDAR_AI_SOLUTION_PATH)
+    set(SPARSE_CONV_ROOT ${LIDAR_AI_SOLUTION_PATH}/libraries/3DSparseConvolution)
+  elseif(DEFINED ENV{LIDAR_AI_SOLUTION_PATH})
+    set(SPARSE_CONV_ROOT $ENV{LIDAR_AI_SOLUTION_PATH}/libraries/3DSparseConvolution)
+  else()
+    message(FATAL_ERROR
+      "Need: -DSPARSE_CONV_ROOT=/path/to/3DSparseConvolution "
+      "(or place it at dependencies/3DSparseConvolution).")
+  endif()
 endif()
 
 if(NOT SPCONV_CUDA_VERSION)
   set(SPCONV_CUDA_VERSION "11.4")
 endif()
 
-set(SPARSE_CONV_ROOT ${LIDAR_AI_SOLUTION_PATH}/libraries/3DSparseConvolution)
 if(NOT EXISTS ${SPARSE_CONV_ROOT}/src/onnx-parser.cpp)
   message(FATAL_ERROR "Invalid 3DSparseConvolution path: ${SPARSE_CONV_ROOT}")
 endif()
+message(STATUS "Using 3DSparseConvolution: ${SPARSE_CONV_ROOT}")
 
 find_package(Protobuf REQUIRED)
 
