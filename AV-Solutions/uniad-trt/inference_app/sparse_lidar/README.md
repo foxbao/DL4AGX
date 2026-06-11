@@ -58,7 +58,9 @@ LD_LIBRARY_PATH=/home/baojiali/Downloads/TensorRT-10.7.0.23/targets/x86_64-linux
 ```
 
 ```bash
-./inference_app/sparse_lidar/build/validate_sparse_trt \
+CUDA_VISIBLE_DEVICES=0 \
+LD_LIBRARY_PATH=/home/baojiali/Downloads/TensorRT-10.7.0.23/lib:$LD_LIBRARY_PATH \
+  ./inference_app/sparse_lidar/build/validate_sparse_trt \
   UniAD_train/UniAD/onnx/bevformer_lidar_sparse_encoder_epoch1.onnx \
   UniAD_train/UniAD/dumped_inputs/bevformer_lidar_sparse_encoder_epoch1/infer.voxels \
   UniAD_train/UniAD/dumped_inputs/bevformer_lidar_sparse_encoder_epoch1/infer.coors \
@@ -67,5 +69,25 @@ LD_LIBRARY_PATH=/home/baojiali/Downloads/TensorRT-10.7.0.23/targets/x86_64-linux
   inference_app/enqueueV3/build_trt107/libuniad_plugin.so \
   UniAD_train/UniAD/dumped_inputs/bevformer_lidar_raw_golden/test_000000 \
   inference_app/sparse_lidar/build/sparse_frontend_dense_trt \
+  41 960 1280
+```
+
+To validate the raw-points runtime front-end, replace the dumped sparse inputs
+with `--raw-points`. The C++ front-end hard-voxelizes `Nx4` float32 points with
+the `base_bevformer_lidar.py` voxel settings, applies the HardSimpleVFE mean
+feature, then feeds libspconv.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+LD_LIBRARY_PATH=/home/baojiali/Downloads/TensorRT-10.7.0.23/lib:$LD_LIBRARY_PATH \
+  ./inference_app/sparse_lidar/build/validate_sparse_trt \
+  UniAD_train/UniAD/onnx/bevformer_lidar_sparse_encoder_epoch1.onnx \
+  --raw-points \
+  UniAD_train/UniAD/dumped_inputs/bevformer_lidar_raw_golden/test_000000/current/raw_points_0.bin \
+  UniAD/engine/bevformer_lidar_backbone_neck_epoch1_trt10.7_sm89.engine \
+  UniAD/engine/bevformer_lidar_bev_trt_epoch1_trt10.7_sm89.engine \
+  inference_app/enqueueV3/build_trt107/libuniad_plugin.so \
+  UniAD_train/UniAD/dumped_inputs/bevformer_lidar_raw_golden/test_000000 \
+  inference_app/sparse_lidar/build/raw_points_frontend_dense_trt \
   41 960 1280
 ```

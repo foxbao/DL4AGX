@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <dlfcn.h>
 
@@ -13,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <memory>
 #include <numeric>
@@ -31,6 +33,12 @@ namespace {
 constexpr int kDefaultGridZ = 41;
 constexpr int kDefaultGridY = 960;
 constexpr int kDefaultGridX = 1280;
+constexpr int kPointFeatureNum = 4;
+constexpr int kMaxPointsPerVoxel = 10;
+constexpr int kMaxVoxels = 160000;
+constexpr float kPointCloudRange[6] = {-64.0f, -48.0f, -2.0f,
+                                       64.0f, 48.0f, 6.0f};
+constexpr float kVoxelSize[3] = {0.1f, 0.1f, 0.2f};
 
 class TrtLogger : public nvinfer1::ILogger {
  public:
@@ -44,9 +52,9 @@ class TrtLogger : public nvinfer1::ILogger {
 void usage(const char* program) {
   std::fprintf(
       stderr,
-      "Usage: %s <sparse.onnx> <features.tensor> <indices.tensor> "
-      "<frontend.engine> <dense.engine> <plugin.so> <golden_run_dir> "
-      "<output_prefix> [grid_z grid_y grid_x]\n",
+      "Usage: %s <sparse.onnx> (<features.tensor> <indices.tensor> | "
+      "--raw-points <raw_points.bin>) <frontend.engine> <dense.engine> "
+      "<plugin.so> <golden_run_dir> <output_prefix> [grid_z grid_y grid_x]\n",
       program);
 }
 
@@ -67,6 +75,30 @@ void check_cuda(cudaError_t status, const char* call) {
     std::exit(2);
   }
 }
+
+struct DeviceBuffer {
+  void* ptr = nullptr;
+  size_t bytes = 0;
+
+  DeviceBuffer() = default;
+  explicit DeviceBuffer(size_t size) { reset(size); }
+  ~DeviceBuffer() { reset(0); }
+
+  DeviceBuffer(const DeviceBuffer&) = delete;
+  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+  void reset(size_t size) {
+    if (ptr != nullptr) {
+      check_cuda(cudaFree(ptr), "cudaFree");
+      ptr = nullptr;
+      bytes = 0;
+    }
+    if (size > 0) {
+      check_cuda(cudaMalloc(&ptr, size), "cudaMalloc");
+      bytes = size;
+    }
+  }
+};
 
 std::string join_path(const std::string& dir, const std::string& name) {
   if (dir.empty() || dir.back() == '/') return dir + name;
@@ -136,6 +168,20 @@ std::vector<float> read_raw_float(const std::string& path, size_t expected_numel
   return data;
 }
 
+std::vector<float> read_all_raw_float(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  require(static_cast<bool>(in), "Failed to open: " + path);
+  in.seekg(0, std::ios::end);
+  const size_t bytes = static_cast<size_t>(in.tellg());
+  in.seekg(0, std::ios::beg);
+  require(bytes % sizeof(float) == 0,
+          "Raw float file byte size is not divisible by sizeof(float): " + path);
+  std::vector<float> data(bytes / sizeof(float));
+  in.read(reinterpret_cast<char*>(data.data()), bytes);
+  require(static_cast<bool>(in), "Failed to read: " + path);
+  return data;
+}
+
 void write_raw_float(const std::string& path, const std::vector<float>& data) {
   std::ofstream out(path, std::ios::binary);
   require(static_cast<bool>(out), "Failed to open output: " + path);
@@ -163,10 +209,169 @@ std::vector<float> tensor_to_float_vector(const spconv::Tensor& tensor) {
   return output;
 }
 
+uint16_t float_to_half_bits(float value) {
+  const __half half_value = __float2half_rn(value);
+  uint16_t bits = 0;
+  std::memcpy(&bits, &half_value, sizeof(bits));
+  return bits;
+}
+
+struct SparseInputSpec {
+  bool use_raw_points = false;
+  std::string features_path;
+  std::string indices_path;
+  std::string raw_points_path;
+};
+
+struct CliArgs {
+  std::string sparse_onnx_path;
+  SparseInputSpec sparse_input;
+  std::string frontend_engine_path;
+  std::string dense_engine_path;
+  std::string plugin_path;
+  std::string golden_run_dir;
+  std::string output_prefix;
+  std::vector<int> grid_size;
+};
+
+struct RawVoxelInput {
+  std::vector<uint16_t> features_half;
+  std::vector<int32_t> coors;
+  size_t num_points = 0;
+  size_t num_voxels = 0;
+};
+
+CliArgs parse_cli(int argc, char** argv) {
+  if (argc != 9 && argc != 12) {
+    usage(argv[0]);
+    std::exit(2);
+  }
+
+  CliArgs args;
+  args.sparse_onnx_path = argv[1];
+  args.grid_size = parse_grid(argc, argv);
+  if (std::string(argv[2]) == "--raw-points") {
+    args.sparse_input.use_raw_points = true;
+    args.sparse_input.raw_points_path = argv[3];
+    args.frontend_engine_path = argv[4];
+    args.dense_engine_path = argv[5];
+    args.plugin_path = argv[6];
+    args.golden_run_dir = argv[7];
+    args.output_prefix = argv[8];
+  } else {
+    args.sparse_input.features_path = argv[2];
+    args.sparse_input.indices_path = argv[3];
+    args.frontend_engine_path = argv[4];
+    args.dense_engine_path = argv[5];
+    args.plugin_path = argv[6];
+    args.golden_run_dir = argv[7];
+    args.output_prefix = argv[8];
+  }
+  return args;
+}
+
+RawVoxelInput voxelize_raw_points(const std::string& raw_points_path) {
+  const std::vector<float> points = read_all_raw_float(raw_points_path);
+  require(points.size() % kPointFeatureNum == 0,
+          "Raw points file does not contain Nx4 float32 points: " + raw_points_path);
+
+  const size_t num_points = points.size() / kPointFeatureNum;
+  std::unordered_map<int64_t, int32_t> voxel_index_by_key;
+  voxel_index_by_key.reserve(std::min(num_points, static_cast<size_t>(kMaxVoxels)));
+  std::vector<float> feature_sums;
+  std::vector<int32_t> point_counts;
+  std::vector<int32_t> coors;
+  feature_sums.reserve(static_cast<size_t>(kMaxVoxels) * kPointFeatureNum);
+  point_counts.reserve(kMaxVoxels);
+  coors.reserve(static_cast<size_t>(kMaxVoxels) * 4);
+
+  const int grid_x = static_cast<int>(
+      std::round((kPointCloudRange[3] - kPointCloudRange[0]) / kVoxelSize[0]));
+  const int grid_y = static_cast<int>(
+      std::round((kPointCloudRange[4] - kPointCloudRange[1]) / kVoxelSize[1]));
+  const int grid_z = static_cast<int>(
+      std::round((kPointCloudRange[5] - kPointCloudRange[2]) / kVoxelSize[2]));
+
+  for (size_t point_idx = 0; point_idx < num_points; ++point_idx) {
+    const float* point = points.data() + point_idx * kPointFeatureNum;
+    const float px = point[0];
+    const float py = point[1];
+    const float pz = point[2];
+    if (px < kPointCloudRange[0] || px >= kPointCloudRange[3] ||
+        py < kPointCloudRange[1] || py >= kPointCloudRange[4] ||
+        pz < kPointCloudRange[2] || pz >= kPointCloudRange[5]) {
+      continue;
+    }
+
+    const int cx = static_cast<int>(
+        std::floor((px - kPointCloudRange[0]) / kVoxelSize[0]));
+    const int cy = static_cast<int>(
+        std::floor((py - kPointCloudRange[1]) / kVoxelSize[1]));
+    const int cz = static_cast<int>(
+        std::floor((pz - kPointCloudRange[2]) / kVoxelSize[2]));
+    if (cx < 0 || cx >= grid_x || cy < 0 || cy >= grid_y ||
+        cz < 0 || cz >= grid_z) {
+      continue;
+    }
+
+    const int64_t voxel_key =
+        (static_cast<int64_t>(cz) * grid_y + cy) * grid_x + cx;
+    auto iter = voxel_index_by_key.find(voxel_key);
+    int32_t voxel_index = 0;
+    if (iter == voxel_index_by_key.end()) {
+      if (point_counts.size() >= static_cast<size_t>(kMaxVoxels)) {
+        continue;
+      }
+      voxel_index = static_cast<int32_t>(point_counts.size());
+      voxel_index_by_key.emplace(voxel_key, voxel_index);
+      coors.push_back(0);
+      coors.push_back(cz);
+      coors.push_back(cy);
+      coors.push_back(cx);
+      point_counts.push_back(0);
+      for (int feature = 0; feature < kPointFeatureNum; ++feature) {
+        feature_sums.push_back(0.0f);
+      }
+    } else {
+      voxel_index = iter->second;
+    }
+
+    int32_t& point_count = point_counts[voxel_index];
+    if (point_count >= kMaxPointsPerVoxel) {
+      continue;
+    }
+    const size_t feature_base =
+        static_cast<size_t>(voxel_index) * kPointFeatureNum;
+    for (int feature = 0; feature < kPointFeatureNum; ++feature) {
+      feature_sums[feature_base + feature] += point[feature];
+    }
+    ++point_count;
+  }
+
+  const size_t num_voxels = point_counts.size();
+  require(num_voxels > 0, "Raw point voxelization produced no voxels.");
+
+  RawVoxelInput output;
+  output.num_points = num_points;
+  output.num_voxels = num_voxels;
+  output.coors = std::move(coors);
+  output.features_half.resize(num_voxels * kPointFeatureNum);
+  for (size_t voxel = 0; voxel < num_voxels; ++voxel) {
+    const int32_t point_count = point_counts[voxel];
+    require(point_count > 0, "Internal error: empty generated voxel.");
+    const size_t feature_base = voxel * kPointFeatureNum;
+    for (int feature = 0; feature < kPointFeatureNum; ++feature) {
+      const float mean = feature_sums[feature_base + feature] /
+                         static_cast<float>(point_count);
+      output.features_half[feature_base + feature] = float_to_half_bits(mean);
+    }
+  }
+  return output;
+}
+
 std::vector<float> run_sparse_encoder(
     const std::string& onnx_path,
-    const std::string& features_path,
-    const std::string& indices_path,
+    const SparseInputSpec& sparse_input,
     const std::vector<int>& grid_size,
     cudaStream_t stream) {
   spconv::set_verbose(std::getenv("SPARSE_LIDAR_VERBOSE") != nullptr);
@@ -175,24 +380,66 @@ std::vector<float> run_sparse_encoder(
           onnx_path, spconv::Precision::Float16, stream, false);
   require(static_cast<bool>(engine), "Failed to load sparse ONNX engine.");
 
-  spconv::Tensor features = spconv::Tensor::load(features_path.c_str(), true, stream);
-  spconv::Tensor indices = spconv::Tensor::load(indices_path.c_str(), true, stream);
+  spconv::Tensor features;
+  spconv::Tensor indices;
+  DeviceBuffer raw_features_device;
+  DeviceBuffer raw_indices_device;
+  std::vector<int64_t> feature_shape;
+  std::vector<int64_t> index_shape;
+  void* feature_ptr = nullptr;
+  void* index_ptr = nullptr;
+
+  if (sparse_input.use_raw_points) {
+    RawVoxelInput raw_input = voxelize_raw_points(sparse_input.raw_points_path);
+    raw_features_device.reset(raw_input.features_half.size() * sizeof(uint16_t));
+    raw_indices_device.reset(raw_input.coors.size() * sizeof(int32_t));
+    check_cuda(cudaMemcpyAsync(raw_features_device.ptr,
+                               raw_input.features_half.data(),
+                               raw_features_device.bytes,
+                               cudaMemcpyHostToDevice, stream),
+               "cudaMemcpyAsync(raw-features-H2D)");
+    check_cuda(cudaMemcpyAsync(raw_indices_device.ptr,
+                               raw_input.coors.data(),
+                               raw_indices_device.bytes,
+                               cudaMemcpyHostToDevice, stream),
+               "cudaMemcpyAsync(raw-coors-H2D)");
+    feature_shape = {static_cast<int64_t>(raw_input.num_voxels),
+                     kPointFeatureNum};
+    index_shape = {static_cast<int64_t>(raw_input.num_voxels), 4};
+    feature_ptr = raw_features_device.ptr;
+    index_ptr = raw_indices_device.ptr;
+    std::printf("raw points: %zu x %d from %s\n",
+                raw_input.num_points, kPointFeatureNum,
+                sparse_input.raw_points_path.c_str());
+    std::printf("generated sparse input: %zu voxels, max_points_per_voxel=%d, "
+                "max_voxels=%d\n",
+                raw_input.num_voxels, kMaxPointsPerVoxel, kMaxVoxels);
+  } else {
+    features = spconv::Tensor::load(
+        sparse_input.features_path.c_str(), true, stream);
+    indices = spconv::Tensor::load(
+        sparse_input.indices_path.c_str(), true, stream);
+    feature_shape = features.shape;
+    index_shape = indices.shape;
+    feature_ptr = features.ptr();
+    index_ptr = indices.ptr();
+  }
   check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(load-sparse)");
 
   std::printf("libspconv version: %s\n", NVSPCONV_VERSION);
   std::printf("sparse features: %s dtype=%s\n",
-              shape_string(features.shape).c_str(),
-              spconv::dtype_string(features.dtype()));
+              shape_string(feature_shape).c_str(),
+              spconv::dtype_string(spconv::DataType::Float16));
   std::printf("sparse indices: %s dtype=%s\n",
-              shape_string(indices.shape).c_str(),
-              spconv::dtype_string(indices.dtype()));
+              shape_string(index_shape).c_str(),
+              spconv::dtype_string(spconv::DataType::Int32));
   std::printf("sparse grid_size: %d x %d x %d\n",
               grid_size[0], grid_size[1], grid_size[2]);
 
   engine->input(0)->features().reference(
-      features.ptr(), features.shape, spconv::DataType::Float16);
+      feature_ptr, feature_shape, spconv::DataType::Float16);
   engine->input(0)->indices().reference(
-      indices.ptr(), indices.shape, spconv::DataType::Int32);
+      index_ptr, index_shape, spconv::DataType::Int32);
   engine->input(0)->set_grid_size(grid_size);
   engine->forward(stream);
   check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(sparse-forward)");
@@ -206,30 +453,6 @@ std::vector<float> run_sparse_encoder(
 
   return tensor_to_float_vector(output_host);
 }
-
-struct DeviceBuffer {
-  void* ptr = nullptr;
-  size_t bytes = 0;
-
-  DeviceBuffer() = default;
-  explicit DeviceBuffer(size_t size) { reset(size); }
-  ~DeviceBuffer() { reset(0); }
-
-  DeviceBuffer(const DeviceBuffer&) = delete;
-  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-  void reset(size_t size) {
-    if (ptr != nullptr) {
-      check_cuda(cudaFree(ptr), "cudaFree");
-      ptr = nullptr;
-      bytes = 0;
-    }
-    if (size > 0) {
-      check_cuda(cudaMalloc(&ptr, size), "cudaMalloc");
-      bytes = size;
-    }
-  }
-};
 
 void copy_float_to_device(
     const std::vector<float>& host,
@@ -379,32 +602,19 @@ std::vector<float> run_single_input_trt(
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 9 && argc != 12) {
-    usage(argv[0]);
-    return 2;
-  }
-
-  const std::string sparse_onnx_path = argv[1];
-  const std::string features_path = argv[2];
-  const std::string indices_path = argv[3];
-  const std::string frontend_engine_path = argv[4];
-  const std::string dense_engine_path = argv[5];
-  const std::string plugin_path = argv[6];
-  const std::string golden_run_dir = argv[7];
-  const std::string output_prefix = argv[8];
-  const std::vector<int> grid_size = parse_grid(argc, argv);
+  const CliArgs args = parse_cli(argc, argv);
 
   cudaStream_t stream = nullptr;
   check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
              "cudaStreamCreateWithFlags");
 
   std::vector<float> middle_bev = run_sparse_encoder(
-      sparse_onnx_path, features_path, indices_path, grid_size, stream);
+      args.sparse_onnx_path, args.sparse_input, args.grid_size, stream);
 
-  load_trt_plugins(plugin_path);
+  load_trt_plugins(args.plugin_path);
 
   std::shared_ptr<TensorRT::Engine> frontend_engine =
-      TensorRT::load(frontend_engine_path);
+      TensorRT::load(args.frontend_engine_path);
   require(static_cast<bool>(frontend_engine),
           "Failed to load LiDAR frontend TensorRT engine.");
   std::vector<float> lidar_bev = run_single_input_trt(
@@ -414,16 +624,17 @@ int main(int argc, char** argv) {
       "lidar_bev",
       middle_bev,
       stream);
-  write_raw_float(output_prefix + "_lidar_bev.bin", lidar_bev);
-  std::printf("saved %s\n", (output_prefix + "_lidar_bev.bin").c_str());
+  write_raw_float(args.output_prefix + "_lidar_bev.bin", lidar_bev);
+  std::printf("saved %s\n", (args.output_prefix + "_lidar_bev.bin").c_str());
   std::printf("Compare LiDAR frontend output:\n");
   compare_arrays(
       "lidar_bev",
-      read_raw_float(join_path(golden_run_dir, "current/lidar_bev.bin"),
+      read_raw_float(join_path(args.golden_run_dir, "current/lidar_bev.bin"),
                      lidar_bev.size()),
       lidar_bev);
 
-  std::shared_ptr<TensorRT::Engine> dense_engine = TensorRT::load(dense_engine_path);
+  std::shared_ptr<TensorRT::Engine> dense_engine =
+      TensorRT::load(args.dense_engine_path);
   require(static_cast<bool>(dense_engine), "Failed to load dense TensorRT engine.");
   dense_engine->print("Dense-BEV TensorRT");
 
@@ -439,7 +650,7 @@ int main(int argc, char** argv) {
   require(lidar_bev.size() == lidar_numel,
           "Sparse dense BEV numel does not match TensorRT lidar_bev input.");
 
-  const std::string dense_input_dir = join_path(golden_run_dir, "dense");
+  const std::string dense_input_dir = join_path(args.golden_run_dir, "dense");
   std::vector<float> prev_bev = read_raw_float(
       join_path(dense_input_dir, "prev_bev.bin"), prev_numel);
   std::vector<float> shift = read_raw_float(
@@ -493,8 +704,8 @@ int main(int argc, char** argv) {
     const TensorRT::DType dtype = dense_engine->dtype(name);
     std::vector<float> got = copy_device_to_float(
         *output_buffers[name], numel, dtype, stream);
-    write_raw_float(output_prefix + "_" + name + ".bin", got);
-    std::printf("saved %s\n", (output_prefix + "_" + name + ".bin").c_str());
+    write_raw_float(args.output_prefix + "_" + name + ".bin", got);
+    std::printf("saved %s\n", (args.output_prefix + "_" + name + ".bin").c_str());
     std::vector<float> ref = read_raw_float(
         join_path(dense_input_dir, name + ".bin"), numel);
     compare_arrays(name, ref, got);
