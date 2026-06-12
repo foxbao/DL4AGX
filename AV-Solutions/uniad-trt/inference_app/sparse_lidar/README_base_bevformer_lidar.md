@@ -1,4 +1,4 @@
-# UniAD LiDAR TensorRT 部署流程
+# UniAD base_bevformer_lidar TensorRT 部署流程
 
 这份文档记录 `base_bevformer_lidar.py` 的 LiDAR 部署链路。当前链路是：
 

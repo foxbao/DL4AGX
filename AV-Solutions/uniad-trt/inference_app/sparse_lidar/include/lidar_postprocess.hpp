@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "lidar_runtime.hpp"
 #include "tensorrt.hpp"
 
 namespace uniad_lidar {
@@ -43,6 +44,13 @@ std::vector<Detection> decode_lidar_detections(
     const std::vector<TRT_INT_TYPE>& cls_shape,
     const std::vector<float>& all_bbox_preds,
     const std::vector<TRT_INT_TYPE>& bbox_shape,
+    const DetectionDecodeConfig& config = DetectionDecodeConfig());
+
+std::vector<Detection> decode_track_detections(
+    const NamedTensor& bboxes,
+    const NamedTensor& scores,
+    const NamedTensor& labels,
+    const NamedTensor& obj_idxes,
     const DetectionDecodeConfig& config = DetectionDecodeConfig());
 
 void write_detections_txt(

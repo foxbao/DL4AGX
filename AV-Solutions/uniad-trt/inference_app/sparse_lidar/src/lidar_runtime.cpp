@@ -66,6 +66,125 @@ uint16_t float_to_half_bits(float value) {
   return bits;
 }
 
+bool has_tensor(
+    const std::shared_ptr<TensorRT::Engine>& engine,
+    const std::string& name) {
+  for (int i = 0; i < engine->num_bindings(); ++i) {
+    if (engine->get_binding_name(i) == name) return true;
+  }
+  return false;
+}
+
+bool has_dynamic_dim(const std::vector<TRT_INT_TYPE>& dims) {
+  return std::any_of(dims.begin(), dims.end(), [](TRT_INT_TYPE dim) {
+    return dim < 0;
+  });
+}
+
+bool is_track_state_name(const std::string& name) {
+  return name.find("prev_track_intances") == 0;
+}
+
+bool is_detection_list_output(const std::string& name) {
+  return name == "bboxes_dict_bboxes" || name == "scores" ||
+         name == "labels" || name == "bbox_index" || name == "obj_idxes";
+}
+
+std::vector<TRT_INT_TYPE> output_allocation_dims(
+    const std::string& name,
+    const std::vector<TRT_INT_TYPE>& dims,
+    int max_track_state_len,
+    int max_detections) {
+  require(max_track_state_len > 0, "max_track_state_len must be positive.");
+  require(max_detections > 0, "max_detections must be positive.");
+  std::vector<TRT_INT_TYPE> out = dims;
+  for (size_t i = 0; i < out.size(); ++i) {
+    if (i == 0 && is_track_state_name(name)) {
+      out[i] = static_cast<TRT_INT_TYPE>(max_track_state_len);
+    } else if (i == 0 && is_detection_list_output(name)) {
+      out[i] = static_cast<TRT_INT_TYPE>(max_detections);
+    } else if (out[i] > 0) {
+      continue;
+    } else if (out[i] == 0) {
+      continue;
+    } else {
+      fail("No allocation fallback for dynamic TensorRT output: " + name);
+    }
+  }
+  return out;
+}
+
+std::string dtype_name(TensorRT::DType dtype) {
+  switch (dtype) {
+    case TensorRT::DType::FLOAT:
+      return "float32";
+    case TensorRT::DType::HALF:
+      return "float16";
+    case TensorRT::DType::INT32:
+      return "int32";
+    case TensorRT::DType::INT8:
+      return "int8";
+    case TensorRT::DType::BOOL:
+      return "bool";
+    case TensorRT::DType::UINT8:
+      return "uint8";
+    case TensorRT::DType::INT64:
+      return "int64";
+    default:
+      return "unsupported";
+  }
+}
+
+void require_tensor_numel(
+    const NamedTensor& tensor,
+    const std::string& name,
+    TensorRT::DType expected_dtype) {
+  const size_t expected_numel = product(tensor.shape);
+  if (expected_dtype == TensorRT::DType::FLOAT) {
+    require(tensor.data.size() == expected_numel,
+            name + " float data size does not match shape.");
+  } else if (expected_dtype == TensorRT::DType::INT32) {
+    require(tensor.int_data.size() == expected_numel ||
+                tensor.data.size() == expected_numel,
+            name + " int32 data size does not match shape.");
+  } else {
+    fail(name + " uses unsupported TensorRT input dtype: " +
+         dtype_name(expected_dtype));
+  }
+}
+
+void copy_tensor_to_device(
+    const NamedTensor& tensor,
+    const std::string& name,
+    TensorRT::DType expected_dtype,
+    DeviceBuffer* device,
+    cudaStream_t stream) {
+  require_tensor_numel(tensor, name, expected_dtype);
+  if (expected_dtype == TensorRT::DType::FLOAT) {
+    if (!tensor.data.empty()) {
+      copy_float_to_device(tensor.data, device, stream);
+      return;
+    }
+    std::vector<float> converted(tensor.int_data.begin(), tensor.int_data.end());
+    copy_float_to_device(converted, device, stream);
+    return;
+  }
+  if (expected_dtype == TensorRT::DType::INT32) {
+    if (!tensor.int_data.empty()) {
+      copy_int32_to_device(tensor.int_data, device, stream);
+      return;
+    }
+    std::vector<int32_t> converted(tensor.data.size());
+    for (size_t i = 0; i < tensor.data.size(); ++i) {
+      converted[i] = static_cast<int32_t>(std::lround(tensor.data[i]));
+    }
+    copy_int32_to_device(converted, device, stream);
+    return;
+  }
+  fail(name + " uses unsupported TensorRT input dtype: " +
+       dtype_name(expected_dtype));
+}
+
 }  // namespace
 
 DeviceBuffer::DeviceBuffer(size_t size) { reset(size); }
@@ -178,12 +297,80 @@ std::vector<float> read_all_raw_float(const std::string& path) {
   return data;
 }
 
+std::vector<int32_t> read_raw_int32(
+    const std::string& path, size_t expected_numel) {
+  std::ifstream in(path, std::ios::binary);
+  require(static_cast<bool>(in), "Failed to open: " + path);
+  in.seekg(0, std::ios::end);
+  const size_t bytes = static_cast<size_t>(in.tellg());
+  in.seekg(0, std::ios::beg);
+  require(bytes == expected_numel * sizeof(int32_t),
+          "Unexpected byte size for " + path + ": " + std::to_string(bytes));
+  std::vector<int32_t> data(expected_numel);
+  in.read(reinterpret_cast<char*>(data.data()), bytes);
+  require(static_cast<bool>(in), "Failed to read: " + path);
+  return data;
+}
+
 void write_raw_float(const std::string& path, const std::vector<float>& data) {
   std::ofstream out(path, std::ios::binary);
   require(static_cast<bool>(out), "Failed to open output: " + path);
   out.write(reinterpret_cast<const char*>(data.data()),
             static_cast<std::streamsize>(data.size() * sizeof(float)));
   require(static_cast<bool>(out), "Failed to write output: " + path);
+}
+
+void write_raw_int32(const std::string& path, const std::vector<int32_t>& data) {
+  std::ofstream out(path, std::ios::binary);
+  require(static_cast<bool>(out), "Failed to open output: " + path);
+  out.write(reinterpret_cast<const char*>(data.data()),
+            static_cast<std::streamsize>(data.size() * sizeof(int32_t)));
+  require(static_cast<bool>(out), "Failed to write output: " + path);
+}
+
+NamedTensor read_raw_tensor(
+    const std::string& path,
+    TensorRT::DType dtype,
+    const std::vector<TRT_INT_TYPE>& shape) {
+  NamedTensor tensor;
+  tensor.shape = shape;
+  tensor.dtype = dtype;
+  const size_t expected_numel = product(shape);
+  if (dtype == TensorRT::DType::FLOAT) {
+    tensor.data = read_raw_float(path, expected_numel);
+    return tensor;
+  }
+  if (dtype == TensorRT::DType::INT32) {
+    tensor.int_data = read_raw_int32(path, expected_numel);
+    return tensor;
+  }
+  fail("Unsupported raw tensor dtype for " + path + ": " + dtype_name(dtype));
+}
+
+void write_raw_tensor(const std::string& path, const NamedTensor& tensor) {
+  if (tensor.dtype == TensorRT::DType::INT32) {
+    if (!tensor.int_data.empty()) {
+      write_raw_int32(path, tensor.int_data);
+      return;
+    }
+    std::vector<int32_t> converted(tensor.data.size());
+    for (size_t i = 0; i < tensor.data.size(); ++i) {
+      converted[i] = static_cast<int32_t>(std::lround(tensor.data[i]));
+    }
+    write_raw_int32(path, converted);
+    return;
+  }
+  if (tensor.dtype == TensorRT::DType::FLOAT ||
+      tensor.dtype == TensorRT::DType::HALF) {
+    if (!tensor.data.empty()) {
+      write_raw_float(path, tensor.data);
+      return;
+    }
+    std::vector<float> converted(tensor.int_data.begin(), tensor.int_data.end());
+    write_raw_float(path, converted);
+    return;
+  }
+  fail("Unsupported raw tensor dtype for output: " + dtype_name(tensor.dtype));
 }
 
 RawVoxelInput voxelize_raw_points(const std::string& raw_points_path) {
@@ -389,9 +576,21 @@ void copy_float_to_device(
     DeviceBuffer* device,
     cudaStream_t stream) {
   device->reset(host.size() * sizeof(float));
+  if (host.empty()) return;
   check_cuda(cudaMemcpyAsync(device->ptr, host.data(), device->bytes,
                              cudaMemcpyHostToDevice, stream),
              "cudaMemcpyAsync(H2D)");
+}
+
+void copy_int32_to_device(
+    const std::vector<int32_t>& host,
+    DeviceBuffer* device,
+    cudaStream_t stream) {
+  device->reset(host.size() * sizeof(int32_t));
+  if (host.empty()) return;
+  check_cuda(cudaMemcpyAsync(device->ptr, host.data(), device->bytes,
+                             cudaMemcpyHostToDevice, stream),
+             "cudaMemcpyAsync(H2D-int32)");
 }
 
 std::vector<float> copy_device_to_float(
@@ -401,6 +600,7 @@ std::vector<float> copy_device_to_float(
     cudaStream_t stream) {
   if (dtype == TensorRT::DType::FLOAT) {
     std::vector<float> host(numel);
+    if (numel == 0) return host;
     check_cuda(cudaMemcpyAsync(host.data(), device.ptr, numel * sizeof(float),
                                cudaMemcpyDeviceToHost, stream),
                "cudaMemcpyAsync(D2H-float)");
@@ -410,6 +610,7 @@ std::vector<float> copy_device_to_float(
   }
   if (dtype == TensorRT::DType::HALF) {
     std::vector<uint16_t> half_host(numel);
+    if (numel == 0) return {};
     check_cuda(cudaMemcpyAsync(half_host.data(), device.ptr,
                                numel * sizeof(uint16_t),
                                cudaMemcpyDeviceToHost, stream),
@@ -422,7 +623,46 @@ std::vector<float> copy_device_to_float(
     }
     return host;
   }
+  if (dtype == TensorRT::DType::INT32) {
+    std::vector<int32_t> int_host(numel);
+    if (numel == 0) return {};
+    check_cuda(cudaMemcpyAsync(int_host.data(), device.ptr,
+                               numel * sizeof(int32_t),
+                               cudaMemcpyDeviceToHost, stream),
+               "cudaMemcpyAsync(D2H-int32)");
+    check_cuda(cudaStreamSynchronize(stream),
+               "cudaStreamSynchronize(D2H-int32)");
+    return std::vector<float>(int_host.begin(), int_host.end());
+  }
   fail("Unsupported TensorRT output dtype for compare.");
+}
+
+NamedTensor copy_device_to_tensor(
+    const DeviceBuffer& device,
+    const std::vector<TRT_INT_TYPE>& shape,
+    TensorRT::DType dtype,
+    cudaStream_t stream) {
+  NamedTensor tensor;
+  tensor.shape = shape;
+  tensor.dtype = dtype;
+  const size_t numel = product(shape);
+  if (dtype == TensorRT::DType::FLOAT ||
+      dtype == TensorRT::DType::HALF) {
+    tensor.data = copy_device_to_float(device, numel, dtype, stream);
+    return tensor;
+  }
+  if (dtype == TensorRT::DType::INT32) {
+    tensor.int_data.resize(numel);
+    if (numel == 0) return tensor;
+    check_cuda(cudaMemcpyAsync(tensor.int_data.data(), device.ptr,
+                               numel * sizeof(int32_t),
+                               cudaMemcpyDeviceToHost, stream),
+               "cudaMemcpyAsync(D2H-tensor-int32)");
+    check_cuda(cudaStreamSynchronize(stream),
+               "cudaStreamSynchronize(D2H-tensor-int32)");
+    return tensor;
+  }
+  fail("Unsupported TensorRT output dtype: " + dtype_name(dtype));
 }
 
 void load_trt_plugins(const std::string& plugin_path) {
@@ -566,6 +806,145 @@ TensorMap run_dense_bev_trt(
     tensor.dtype = dtype;
     tensor.data = copy_device_to_float(*output_buffers[name], numel, dtype, stream);
     outputs[name] = std::move(tensor);
+  }
+  return outputs;
+}
+
+TensorMap run_track_lidar_trt(
+    const std::shared_ptr<TensorRT::Engine>& engine,
+    const TrackLidarInput& input,
+    const std::vector<std::string>& output_names,
+    cudaStream_t stream,
+    const std::string& label,
+    bool print_info,
+    int max_track_state_len,
+    int max_detections) {
+  if (print_info) {
+    engine->print(label.c_str());
+  }
+
+  const std::vector<std::string> fixed_float_inputs = {
+      "lidar_bev", "prev_bev", "shift", "use_prev_bev",
+      "prev_timestamp", "prev_l2g_r_mat", "prev_l2g_t",
+      "timestamp", "l2g_r_mat", "l2g_t"};
+  for (const std::string& name : fixed_float_inputs) {
+    require(has_tensor(engine, name),
+            "Missing TensorRT input: " + name);
+    require_float_input(engine, name);
+  }
+  require(has_tensor(engine, "max_obj_id"), "Missing TensorRT input: max_obj_id");
+  require(engine->dtype("max_obj_id") == TensorRT::DType::INT32,
+          "max_obj_id must be an int32 TensorRT input.");
+
+  const std::vector<std::string> state_inputs = {
+      "prev_track_intances0", "prev_track_intances1", "prev_track_intances3",
+      "prev_track_intances4", "prev_track_intances5", "prev_track_intances6",
+      "prev_track_intances8", "prev_track_intances9", "prev_track_intances11",
+      "prev_track_intances12", "prev_track_intances13"};
+  for (const std::string& name : state_inputs) {
+    require(has_tensor(engine, name), "Missing TensorRT input: " + name);
+    const TensorRT::DType dtype = engine->dtype(name);
+    require(dtype == TensorRT::DType::FLOAT || dtype == TensorRT::DType::INT32,
+            name + " must be float32 or int32.");
+    require(input.track_state.find(name) != input.track_state.end(),
+            "Missing track state tensor: " + name);
+    const std::vector<TRT_INT_TYPE> static_dims = engine->static_dims(name);
+    if (has_dynamic_dim(static_dims)) {
+      require(engine->set_run_dims(name, input.track_state.at(name).shape),
+              "Failed to set dynamic shape for " + name);
+    }
+  }
+
+  std::unordered_map<std::string, std::unique_ptr<DeviceBuffer>> input_buffers;
+  std::unordered_map<std::string, const void*> bindings;
+
+  auto add_fixed_float = [&](const std::string& name,
+                             const std::vector<float>& values) {
+    const size_t expected = static_cast<size_t>(engine->numel(name));
+    require(values.size() == expected,
+            name + " numel mismatch.");
+    auto buffer = std::make_unique<DeviceBuffer>(values.size() * sizeof(float));
+    copy_float_to_device(values, buffer.get(), stream);
+    bindings[name] = buffer->ptr;
+    input_buffers[name] = std::move(buffer);
+  };
+  auto add_fixed_int32 = [&](const std::string& name,
+                             const std::vector<int32_t>& values) {
+    const size_t expected = static_cast<size_t>(engine->numel(name));
+    require(values.size() == expected,
+            name + " numel mismatch.");
+    auto buffer = std::make_unique<DeviceBuffer>(values.size() * sizeof(int32_t));
+    copy_int32_to_device(values, buffer.get(), stream);
+    bindings[name] = buffer->ptr;
+    input_buffers[name] = std::move(buffer);
+  };
+
+  add_fixed_float("lidar_bev", input.lidar_bev);
+  add_fixed_float("prev_bev", input.prev_bev);
+  add_fixed_float("shift", input.shift);
+  add_fixed_float("use_prev_bev", input.use_prev_bev);
+  add_fixed_float("prev_timestamp", input.prev_timestamp);
+  add_fixed_float("prev_l2g_r_mat", input.prev_l2g_r_mat);
+  add_fixed_float("prev_l2g_t", input.prev_l2g_t);
+  add_fixed_float("timestamp", input.timestamp);
+  add_fixed_float("l2g_r_mat", input.l2g_r_mat);
+  add_fixed_float("l2g_t", input.l2g_t);
+  add_fixed_int32("max_obj_id", input.max_obj_id);
+
+  for (const std::string& name : state_inputs) {
+    const TensorRT::DType dtype = engine->dtype(name);
+    const NamedTensor& tensor = input.track_state.at(name);
+    require(tensor.shape == engine->run_dims(name),
+            name + " runtime shape does not match requested input shape.");
+    const size_t expected_numel = static_cast<size_t>(engine->numel(name));
+    require(product(tensor.shape) == expected_numel,
+            name + " dynamic numel mismatch.");
+    auto buffer = std::make_unique<DeviceBuffer>(expected_numel * dtype_size(dtype));
+    copy_tensor_to_device(tensor, name, dtype, buffer.get(), stream);
+    bindings[name] = buffer->ptr;
+    input_buffers[name] = std::move(buffer);
+  }
+
+  std::unordered_map<std::string, std::unique_ptr<DeviceBuffer>> output_buffers;
+  for (const std::string& name : output_names) {
+    require(has_tensor(engine, name), "Missing TensorRT output: " + name);
+    const std::vector<TRT_INT_TYPE> run_shape = engine->run_dims(name);
+    const std::vector<TRT_INT_TYPE> alloc_shape =
+        output_allocation_dims(name, run_shape, max_track_state_len,
+                               max_detections);
+    const size_t alloc_numel = product(alloc_shape);
+    const TensorRT::DType dtype = engine->dtype(name);
+    output_buffers[name] =
+        std::make_unique<DeviceBuffer>(alloc_numel * dtype_size(dtype));
+    bindings[name] = output_buffers[name]->ptr;
+    if (print_info) {
+      std::printf("TRT output %s: run=%s alloc=%s dtype=%s\n",
+                  name.c_str(), shape_string_trt(run_shape).c_str(),
+                  shape_string_trt(alloc_shape).c_str(),
+                  dtype_name(dtype).c_str());
+    }
+  }
+
+  std::unordered_map<std::string, std::vector<TRT_INT_TYPE>> dynamic_output_shapes;
+  nv::EventTimer timer;
+  require(engine->forward(bindings, dynamic_output_shapes, stream, false, timer),
+          label + " enqueue failed.");
+  check_cuda(cudaStreamSynchronize(stream),
+             "cudaStreamSynchronize(track-trt-forward)");
+
+  TensorMap outputs;
+  for (const std::string& name : output_names) {
+    std::vector<TRT_INT_TYPE> dims = engine->run_dims(name);
+    auto iter = dynamic_output_shapes.find(name);
+    if (iter != dynamic_output_shapes.end()) {
+      dims = iter->second;
+    }
+    require(!has_dynamic_dim(dims),
+            "TensorRT did not resolve output shape for " + name);
+    const size_t numel = product(dims);
+    const TensorRT::DType dtype = engine->dtype(name);
+    outputs[name] = copy_device_to_tensor(*output_buffers.at(name), dims,
+                                          dtype, stream);
   }
   return outputs;
 }

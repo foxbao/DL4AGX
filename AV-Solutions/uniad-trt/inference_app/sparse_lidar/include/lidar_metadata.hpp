@@ -15,7 +15,15 @@ struct FrameMetadata {
   bool has_prev_bev_exists = false;
   bool prev_bev_exists = false;
   bool has_ego_motion_delta = false;
+  bool has_timestamp = false;
+  bool has_ego2global = false;
+  double timestamp = 0.0;
   float ego_motion_delta[16] = {
+      1.0f, 0.0f, 0.0f, 0.0f,
+      0.0f, 1.0f, 0.0f, 0.0f,
+      0.0f, 0.0f, 1.0f, 0.0f,
+      0.0f, 0.0f, 0.0f, 1.0f};
+  float ego2global[16] = {
       1.0f, 0.0f, 0.0f, 0.0f,
       0.0f, 1.0f, 0.0f, 0.0f,
       0.0f, 0.0f, 1.0f, 0.0f,

@@ -248,23 +248,35 @@ const JsonValue* select_current_meta(const JsonValue& root) {
   return &current->second;
 }
 
-void parse_matrix4x4(const JsonValue& value, FrameMetadata* metadata) {
+void parse_matrix4x4_into(
+    const JsonValue& value,
+    const char* field_name,
+    float* output) {
   require(value.type == JsonType::Array && value.array_value.size() == 4,
-          "ego_motion_delta must be a 4x4 JSON array.");
+          std::string(field_name) + " must be a 4x4 JSON array.");
   for (size_t row = 0; row < 4; ++row) {
     const JsonValue& row_value = value.array_value[row];
     require(row_value.type == JsonType::Array &&
                 row_value.array_value.size() == 4,
-            "ego_motion_delta must be a 4x4 JSON array.");
+            std::string(field_name) + " must be a 4x4 JSON array.");
     for (size_t col = 0; col < 4; ++col) {
       const JsonValue& number = row_value.array_value[col];
       require(number.type == JsonType::Number,
-              "ego_motion_delta elements must be numbers.");
-      metadata->ego_motion_delta[row * 4 + col] =
-          static_cast<float>(number.number_value);
+              std::string(field_name) + " elements must be numbers.");
+      output[row * 4 + col] = static_cast<float>(number.number_value);
     }
   }
+}
+
+void parse_ego_motion_delta(const JsonValue& value, FrameMetadata* metadata) {
+  parse_matrix4x4_into(
+      value, "ego_motion_delta", metadata->ego_motion_delta);
   metadata->has_ego_motion_delta = true;
+}
+
+void parse_ego2global(const JsonValue& value, FrameMetadata* metadata) {
+  parse_matrix4x4_into(value, "ego2global", metadata->ego2global);
+  metadata->has_ego2global = true;
 }
 
 struct Rotation2D {
@@ -338,7 +350,16 @@ FrameMetadata read_frame_metadata(const std::string& path) {
     metadata.prev_bev_exists = prev->bool_value;
   }
   if (const JsonValue* delta = current->get("ego_motion_delta")) {
-    parse_matrix4x4(*delta, &metadata);
+    parse_ego_motion_delta(*delta, &metadata);
+  }
+  if (const JsonValue* timestamp = current->get("timestamp")) {
+    require(timestamp->type == JsonType::Number,
+            "timestamp must be a JSON number.");
+    metadata.has_timestamp = true;
+    metadata.timestamp = timestamp->number_value;
+  }
+  if (const JsonValue* ego2global = current->get("ego2global")) {
+    parse_ego2global(*ego2global, &metadata);
   }
   return metadata;
 }

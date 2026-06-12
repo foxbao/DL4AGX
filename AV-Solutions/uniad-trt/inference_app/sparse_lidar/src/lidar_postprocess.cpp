@@ -37,6 +37,15 @@ bool center_in_range(
          det.x <= range[3] && det.y <= range[4] && det.z <= range[5];
 }
 
+int tensor_int_at(const NamedTensor& tensor, size_t index) {
+  if (!tensor.int_data.empty()) {
+    require(index < tensor.int_data.size(), "int tensor index out of range.");
+    return tensor.int_data[index];
+  }
+  require(index < tensor.data.size(), "float tensor index out of range.");
+  return static_cast<int>(std::lround(tensor.data[index]));
+}
+
 }  // namespace
 
 std::vector<Detection> decode_lidar_detections(
@@ -128,6 +137,64 @@ std::vector<Detection> decode_lidar_detections(
     det.score = score;
     det.label = label;
     det.query_index = query;
+
+    if (center_in_range(det, config.post_center_range)) {
+      detections.push_back(det);
+    }
+  }
+  return detections;
+}
+
+std::vector<Detection> decode_track_detections(
+    const NamedTensor& bboxes,
+    const NamedTensor& scores,
+    const NamedTensor& labels,
+    const NamedTensor& obj_idxes,
+    const DetectionDecodeConfig& config) {
+  require(bboxes.shape.size() == 2,
+          "bboxes_dict_bboxes shape must be [num_dets, box_code].");
+  require(scores.shape.size() == 1, "scores shape must be [num_dets].");
+  require(labels.shape.size() == 1, "labels shape must be [num_dets].");
+  require(obj_idxes.shape.size() == 1, "obj_idxes shape must be [num_dets].");
+  require(bboxes.shape[1] >= 7,
+          "bboxes_dict_bboxes code dimension must be at least 7.");
+
+  const int num_dets = static_cast<int>(bboxes.shape[0]);
+  const int code_size = static_cast<int>(bboxes.shape[1]);
+  require(scores.shape[0] == num_dets && labels.shape[0] == num_dets &&
+              obj_idxes.shape[0] == num_dets,
+          "Track detection output shapes do not match.");
+  require(bboxes.data.size() ==
+              static_cast<size_t>(num_dets) * static_cast<size_t>(code_size),
+          "bboxes_dict_bboxes data size does not match its shape.");
+  require(scores.data.size() == static_cast<size_t>(num_dets),
+          "scores data size does not match its shape.");
+
+  const int limit = std::min(num_dets, std::max(config.max_num, 0));
+  std::vector<Detection> detections;
+  detections.reserve(static_cast<size_t>(limit));
+  for (int i = 0; i < limit; ++i) {
+    const float score = scores.data[static_cast<size_t>(i)];
+    if (config.score_threshold >= 0.0f && score <= config.score_threshold) {
+      continue;
+    }
+    const float* box = bboxes.data.data() + static_cast<size_t>(i) * code_size;
+
+    Detection det;
+    det.x = box[0];
+    det.y = box[1];
+    det.z = box[2];
+    det.length = box[3];
+    det.width = box[4];
+    det.height = box[5];
+    det.yaw = box[6];
+    if (code_size > 8) {
+      det.vx = box[7];
+      det.vy = box[8];
+    }
+    det.score = score;
+    det.label = tensor_int_at(labels, static_cast<size_t>(i));
+    det.query_index = tensor_int_at(obj_idxes, static_cast<size_t>(i));
 
     if (center_in_range(det, config.post_center_range)) {
       detections.push_back(det);
