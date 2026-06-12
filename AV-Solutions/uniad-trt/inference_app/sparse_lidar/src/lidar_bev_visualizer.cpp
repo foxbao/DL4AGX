@@ -185,15 +185,19 @@ void write_detections(
     out << "<line x1=\"" << center.x << "\" y1=\"" << center.y
         << "\" x2=\"" << vel.x << "\" y2=\"" << vel.y
         << "\" stroke-opacity=\"0.65\"/>\n";
-    out << "<text x=\"" << center.x + 4 << "\" y=\"" << center.y - 4
-        << "\" font-size=\"12\" fill=\"" << color_string(color)
-        << "\" stroke=\"none\">";
+    const int font_size = config.show_track_id ? 22 : 12;
+    out << "<text x=\"" << center.x + 5 << "\" y=\"" << center.y - 6
+        << "\" font-family=\"Arial, sans-serif\" font-size=\"" << font_size
+        << "\" font-weight=\"700\" fill=\"" << color_string(color)
+        << "\" fill-opacity=\"1\" stroke=\"#101418\" stroke-width=\"4\" "
+        << "stroke-opacity=\"0.95\" paint-order=\"stroke fill\">";
     if (config.show_track_id) {
-      out << "id " << det.query_index << " c" << det.label << " ";
+      out << "ID " << det.query_index;
     } else {
       out << det.label << " ";
+      out << std::fixed << std::setprecision(2) << det.score;
     }
-    out << std::fixed << std::setprecision(2) << det.score << "</text>\n";
+    out << "</text>\n";
     out << "</g>\n";
     ++drawn;
   }

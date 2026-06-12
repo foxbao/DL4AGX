@@ -311,9 +311,9 @@ frame_000001_bev.svg
 frame_000001_bev_compare.svg
 ```
 
-`frame_*_bev.svg` 会按 track id 固定上色，并显示 `id <track_id> c<class>
-<score>`；`frame_*_bev_compare.svg` 左侧是 GT boxes，右侧是带 track id 的 TRT
-prediction。
+`frame_*_bev.svg` 会按 track id 固定上色，并用醒目的 `ID <track_id>` 标签标出
+每个 track；`frame_*_bev_compare.svg` 左侧是 GT boxes，右侧是带 track id 的
+TRT prediction。
 
 `epoch_1.pth` 的 2 帧 smoke test 当前输出：
 
