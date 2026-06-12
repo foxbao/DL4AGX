@@ -486,6 +486,8 @@ CliArgs parse_cli(int argc, char** argv) {
   }
 
   CliArgs args;
+  args.bev_visualization_config.show_track_id = true;
+  args.bev_visualization_config.color_by_track_id = true;
   args.sparse_onnx_path = argv[1];
   args.frontend_engine_path = argv[2];
   args.track_engine_path = argv[3];

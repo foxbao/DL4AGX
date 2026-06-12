@@ -19,6 +19,8 @@ struct BevVisualizationConfig {
   int image_height = 1200;
   int max_draw = 100;
   float min_score = -1.0f;
+  bool show_track_id = false;
+  bool color_by_track_id = false;
   std::array<float, 4> xy_range = {{-64.0f, -48.0f, 64.0f, 48.0f}};
 };
 

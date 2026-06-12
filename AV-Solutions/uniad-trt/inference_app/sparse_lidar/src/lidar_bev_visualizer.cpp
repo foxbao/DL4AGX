@@ -42,6 +42,13 @@ std::string color_string(const Color& color) {
   return out.str();
 }
 
+size_t palette_index(int value) {
+  constexpr size_t kPaletteSize = sizeof(kPalette) / sizeof(kPalette[0]);
+  int index = value % static_cast<int>(kPaletteSize);
+  if (index < 0) index += static_cast<int>(kPaletteSize);
+  return static_cast<size_t>(index);
+}
+
 float scale_for(const BevVisualizationConfig& config) {
   const float x_min = config.xy_range[0];
   const float y_min = config.xy_range[1];
@@ -161,8 +168,9 @@ void write_detections(
     }
     if (config.max_draw >= 0 && drawn >= config.max_draw) break;
 
+    const int color_key = config.color_by_track_id ? det.query_index : det.label;
     const Color& color = use_label_palette
-        ? kPalette[det.label % (sizeof(kPalette) / sizeof(kPalette[0]))]
+        ? kPalette[palette_index(color_key)]
         : fixed_color;
     const std::vector<PixelPoint> corners = box_corners(det, config);
     const PixelPoint center = world_to_pixel(det.x, det.y, config);
@@ -179,8 +187,13 @@ void write_detections(
         << "\" stroke-opacity=\"0.65\"/>\n";
     out << "<text x=\"" << center.x + 4 << "\" y=\"" << center.y - 4
         << "\" font-size=\"12\" fill=\"" << color_string(color)
-        << "\" stroke=\"none\">" << det.label << " "
-        << std::fixed << std::setprecision(2) << det.score << "</text>\n";
+        << "\" stroke=\"none\">";
+    if (config.show_track_id) {
+      out << "id " << det.query_index << " c" << det.label << " ";
+    } else {
+      out << det.label << " ";
+    }
+    out << std::fixed << std::setprecision(2) << det.score << "</text>\n";
     out << "</g>\n";
     ++drawn;
   }
@@ -244,7 +257,10 @@ void write_bev_comparison_svg(
       << ")</text>\n";
 
   out << "<g transform=\"translate(0," << title_height << ")\">\n";
-  write_panel(out, gt_detections, config, false, Color{96, 210, 140});
+  BevVisualizationConfig gt_config = config;
+  gt_config.show_track_id = false;
+  gt_config.color_by_track_id = false;
+  write_panel(out, gt_detections, gt_config, false, Color{96, 210, 140});
   out << "</g>\n";
 
   out << "<g transform=\"translate(" << panel_width + gap << ','
