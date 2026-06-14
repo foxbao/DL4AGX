@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <map>
@@ -279,6 +280,19 @@ void parse_ego2global(const JsonValue& value, FrameMetadata* metadata) {
   metadata->has_ego2global = true;
 }
 
+int32_t parse_int_scalar_or_first(const JsonValue& value,
+                                  const char* field_name) {
+  const JsonValue* current = &value;
+  while (current->type == JsonType::Array) {
+    require(!current->array_value.empty(),
+            std::string(field_name) + " array must not be empty.");
+    current = &current->array_value.front();
+  }
+  require(current->type == JsonType::Number,
+          std::string(field_name) + " must be a number or numeric array.");
+  return static_cast<int32_t>(std::lround(current->number_value));
+}
+
 struct Rotation2D {
   float r00 = 1.0f;
   float r01 = 0.0f;
@@ -360,6 +374,12 @@ FrameMetadata read_frame_metadata(const std::string& path) {
   }
   if (const JsonValue* ego2global = current->get("ego2global")) {
     parse_ego2global(*ego2global, &metadata);
+  }
+  if (const JsonValue* command = current->get("command")) {
+    metadata.command = parse_int_scalar_or_first(*command, "command");
+    require(metadata.command >= 0 && metadata.command <= 2,
+            "command must be 0, 1, or 2.");
+    metadata.has_command = true;
   }
   return metadata;
 }

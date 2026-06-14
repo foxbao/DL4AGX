@@ -85,6 +85,7 @@ struct TrackLidarInput {
   std::vector<float> timestamp;
   std::vector<float> l2g_r_mat;
   std::vector<float> l2g_t;
+  std::vector<float> command;
   std::vector<int32_t> max_obj_id;
   TensorMap track_state;
 };

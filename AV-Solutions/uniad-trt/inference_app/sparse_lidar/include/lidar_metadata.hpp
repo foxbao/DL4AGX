@@ -6,6 +6,7 @@
 #ifndef UNIAD_SPARSE_LIDAR_METADATA_HPP_
 #define UNIAD_SPARSE_LIDAR_METADATA_HPP_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -17,7 +18,9 @@ struct FrameMetadata {
   bool has_ego_motion_delta = false;
   bool has_timestamp = false;
   bool has_ego2global = false;
+  bool has_command = false;
   double timestamp = 0.0;
+  int32_t command = 2;
   float ego_motion_delta[16] = {
       1.0f, 0.0f, 0.0f, 0.0f,
       0.0f, 1.0f, 0.0f, 0.0f,

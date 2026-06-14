@@ -90,6 +90,17 @@ bool is_detection_list_output(const std::string& name) {
          name == "labels" || name == "bbox_index" || name == "obj_idxes";
 }
 
+bool is_motion_list_output(const std::string& name) {
+  return name == "traj_scores_0" || name == "traj_0" ||
+         name == "traj_scores_1" || name == "traj_1" ||
+         name == "traj_scores" || name == "traj" ||
+         name == "valid_traj_masks";
+}
+
+bool is_planning_output(const std::string& name) {
+  return name == "sdc_traj";
+}
+
 std::vector<TRT_INT_TYPE> output_allocation_dims(
     const std::string& name,
     const std::vector<TRT_INT_TYPE>& dims,
@@ -103,6 +114,13 @@ std::vector<TRT_INT_TYPE> output_allocation_dims(
       out[i] = static_cast<TRT_INT_TYPE>(max_track_state_len);
     } else if (i == 0 && is_detection_list_output(name)) {
       out[i] = static_cast<TRT_INT_TYPE>(max_detections);
+    } else if (i == 0 && is_motion_list_output(name)) {
+      out[i] = static_cast<TRT_INT_TYPE>(max_detections);
+    } else if (is_planning_output(name)) {
+      const TRT_INT_TYPE fallback[] = {1, 6, 2};
+      require(out.size() == 3,
+              "Planning output sdc_traj must have shape 1x6x2.");
+      out[i] = fallback[i];
     } else if (out[i] > 0) {
       continue;
     } else if (out[i] == 0) {
@@ -835,6 +853,14 @@ TensorMap run_track_lidar_trt(
   require(has_tensor(engine, "max_obj_id"), "Missing TensorRT input: max_obj_id");
   require(engine->dtype("max_obj_id") == TensorRT::DType::INT32,
           "max_obj_id must be an int32 TensorRT input.");
+  const bool has_command_input = has_tensor(engine, "command");
+  if (has_command_input) {
+    const TensorRT::DType dtype = engine->dtype("command");
+    require(dtype == TensorRT::DType::FLOAT || dtype == TensorRT::DType::INT32,
+            "command must be a float32 or int32 TensorRT input.");
+    require(!input.command.empty(),
+            "TensorRT engine expects command input, but runtime did not set it.");
+  }
 
   const std::vector<std::string> state_inputs = {
       "prev_track_intances0", "prev_track_intances1", "prev_track_intances3",
@@ -890,6 +916,18 @@ TensorMap run_track_lidar_trt(
   add_fixed_float("l2g_r_mat", input.l2g_r_mat);
   add_fixed_float("l2g_t", input.l2g_t);
   add_fixed_int32("max_obj_id", input.max_obj_id);
+  if (has_command_input) {
+    const TensorRT::DType dtype = engine->dtype("command");
+    if (dtype == TensorRT::DType::FLOAT) {
+      add_fixed_float("command", input.command);
+    } else {
+      std::vector<int32_t> command_int(input.command.size());
+      for (size_t i = 0; i < input.command.size(); ++i) {
+        command_int[i] = static_cast<int32_t>(std::lround(input.command[i]));
+      }
+      add_fixed_int32("command", command_int);
+    }
+  }
 
   for (const std::string& name : state_inputs) {
     const TensorRT::DType dtype = engine->dtype(name);
