@@ -171,6 +171,13 @@ if(TENSORRT_PATH)
     src/uniad_lidar_track.cpp
   )
   target_link_libraries(uniad_lidar_track PRIVATE sparse_lidar_trt_runtime)
+  add_executable(uniad_lidar_track_drivable
+    src/uniad_lidar_track.cpp
+  )
+  target_compile_definitions(uniad_lidar_track_drivable PRIVATE
+    UNIAD_LIDAR_TRACK_DRIVABLE_REQUIRED=1
+  )
+  target_link_libraries(uniad_lidar_track_drivable PRIVATE sparse_lidar_trt_runtime)
   add_executable(uniad_lidar_e2e
     src/uniad_lidar_e2e.cpp
   )
@@ -184,6 +191,10 @@ if(TENSORRT_PATH)
     INSTALL_RPATH "${SPCONV_LIB_DIR};${CUDA_LIBRARY_DIRS};${TENSORRT_LIBRARY_DIRS}"
   )
   set_target_properties(uniad_lidar_track PROPERTIES
+    BUILD_RPATH "${SPCONV_LIB_DIR};${CUDA_LIBRARY_DIRS};${TENSORRT_LIBRARY_DIRS}"
+    INSTALL_RPATH "${SPCONV_LIB_DIR};${CUDA_LIBRARY_DIRS};${TENSORRT_LIBRARY_DIRS}"
+  )
+  set_target_properties(uniad_lidar_track_drivable PROPERTIES
     BUILD_RPATH "${SPCONV_LIB_DIR};${CUDA_LIBRARY_DIRS};${TENSORRT_LIBRARY_DIRS}"
     INSTALL_RPATH "${SPCONV_LIB_DIR};${CUDA_LIBRARY_DIRS};${TENSORRT_LIBRARY_DIRS}"
   )

@@ -155,6 +155,71 @@ void write_ego(std::ostream& out, const BevVisualizationConfig& config) {
   out << "</g>\n";
 }
 
+void write_points(
+    std::ostream& out,
+    const std::vector<BevPoint>& points,
+    const BevVisualizationConfig& config) {
+  if (points.empty() || config.max_points == 0) return;
+  const size_t max_points = config.max_points < 0
+      ? points.size()
+      : static_cast<size_t>(config.max_points);
+  const size_t step = std::max<size_t>(1, points.size() / std::max<size_t>(1, max_points));
+  size_t drawn = 0;
+  out << "<g fill=\"#d8e0e8\" fill-opacity=\"0.48\">\n";
+  for (size_t i = 0; i < points.size() && drawn < max_points; i += step) {
+    const PixelPoint p = world_to_pixel(points[i].x, points[i].y, config);
+    out << "<circle cx=\"" << p.x << "\" cy=\"" << p.y
+        << "\" r=\"1.15\"/>\n";
+    ++drawn;
+  }
+  out << "</g>\n";
+}
+
+void write_drivable_mask(
+    std::ostream& out,
+    const DrivableScoreMap& drivable,
+    const BevVisualizationConfig& config) {
+  if (drivable.data.empty()) return;
+  require(drivable.height > 0 && drivable.width > 0,
+          "Drivable score map dimensions must be positive.");
+  require(drivable.data.size() ==
+              static_cast<size_t>(drivable.height * drivable.width),
+          "Drivable score map data size does not match dimensions.");
+
+  const float x_min = config.xy_range[0];
+  const float y_min = config.xy_range[1];
+  const float x_max = config.xy_range[2];
+  const float y_max = config.xy_range[3];
+  // Match GenerateKLDrivableMapLabels: mask col is x, mask row is y.
+  const float dx = (x_max - x_min) / static_cast<float>(drivable.width);
+  const float dy = (y_max - y_min) / static_cast<float>(drivable.height);
+
+  out << "<g fill=\"#25d07d\" stroke=\"none\">\n";
+  for (int row = 0; row < drivable.height; ++row) {
+    const float cell_y1 = y_max - static_cast<float>(row) * dy;
+    const float cell_y0 = cell_y1 - dy;
+    for (int col = 0; col < drivable.width; ++col) {
+      const float score =
+          drivable.data[static_cast<size_t>(row * drivable.width + col)];
+      if (score <= drivable.threshold) continue;
+      const float cell_x0 = x_min + static_cast<float>(col) * dx;
+      const float cell_x1 = cell_x0 + dx;
+      const PixelPoint p0 = world_to_pixel(cell_x0, cell_y0, config);
+      const PixelPoint p1 = world_to_pixel(cell_x1, cell_y1, config);
+      const float x = std::min(p0.x, p1.x);
+      const float y = std::min(p0.y, p1.y);
+      const float w = std::fabs(p1.x - p0.x) + 0.75f;
+      const float h = std::fabs(p1.y - p0.y) + 0.75f;
+      const float opacity = std::min(
+          0.58f, 0.18f + 0.40f * std::max(0.0f, std::min(1.0f, score)));
+      out << "<rect x=\"" << x << "\" y=\"" << y
+          << "\" width=\"" << w << "\" height=\"" << h
+          << "\" fill-opacity=\"" << opacity << "\"/>\n";
+    }
+  }
+  out << "</g>\n";
+}
+
 void write_detections(
     std::ostream& out,
     const std::vector<Detection>& detections,
@@ -271,6 +336,29 @@ void write_bev_comparison_svg(
       << title_height << ")\">\n";
   write_panel(out, pred_detections, config, true, Color{255, 94, 94});
   out << "</g>\n";
+  out << "</svg>\n";
+  require(static_cast<bool>(out), "Failed to write BEV SVG output: " + path);
+}
+
+void write_bev_drivable_svg(
+    const std::string& path,
+    const std::vector<Detection>& detections,
+    const DrivableScoreMap& drivable,
+    const std::vector<BevPoint>& points,
+    const BevVisualizationConfig& config) {
+  std::ofstream out(path);
+  require(static_cast<bool>(out), "Failed to open BEV SVG output: " + path);
+
+  out << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\""
+      << config.image_width << "\" height=\"" << config.image_height
+      << "\" viewBox=\"0 0 " << config.image_width << ' '
+      << config.image_height << "\">\n";
+  out << "<rect width=\"100%\" height=\"100%\" fill=\"#101418\"/>\n";
+  write_grid(out, config);
+  write_drivable_mask(out, drivable, config);
+  write_points(out, points, config);
+  write_ego(out, config);
+  write_detections(out, detections, config, true, Color{255, 94, 94});
   out << "</svg>\n";
   require(static_cast<bool>(out), "Failed to write BEV SVG output: " + path);
 }

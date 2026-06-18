@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -53,6 +54,15 @@ const std::vector<std::string>& track_output_names() {
   return names;
 }
 
+bool engine_has_tensor(
+    const std::shared_ptr<TensorRT::Engine>& engine,
+    const std::string& name) {
+  for (int i = 0; i < engine->num_bindings(); ++i) {
+    if (engine->get_binding_name(i) == name) return true;
+  }
+  return false;
+}
+
 struct CliArgs {
   std::string sparse_onnx_path;
   std::string frontend_engine_path;
@@ -70,6 +80,7 @@ struct CliArgs {
   std::string track_init_dir;
   int track_state_len = 601;
   int max_track_state_len = 901;
+  float drivable_threshold = 0.5f;
   bool write_visualization = true;
   uniad_lidar::DetectionDecodeConfig decode_config;
   uniad_lidar::BevVisualizationConfig bev_visualization_config;
@@ -85,6 +96,7 @@ void usage(const char* program) {
       "[--track-state-len <count>] [--max-track-state-len <count>] "
       "[--score-threshold <score>] [--max-dets <count>] "
       "[--bev-max-draw <count>] [--bev-score-threshold <score>] "
+      "[--bev-max-points <count>] [--drivable-threshold <score>] "
       "[--no-visualization]\n",
       program);
 }
@@ -313,6 +325,103 @@ void ensure_directory(const std::string& path) {
 
 std::string output_prefix(const std::string& output_dir, int frame) {
   return uniad_lidar::join_path(output_dir, "frame_" + zero_pad(frame));
+}
+
+std::vector<uniad_lidar::BevPoint> read_bev_points_for_visualization(
+    const std::string& raw_points_path,
+    const uniad_lidar::BevVisualizationConfig& config) {
+  if (config.max_points == 0) return {};
+  std::ifstream in(raw_points_path, std::ios::binary);
+  uniad_lidar::require(static_cast<bool>(in),
+                       "Failed to open raw points for visualization: " +
+                           raw_points_path);
+  in.seekg(0, std::ios::end);
+  const size_t bytes = static_cast<size_t>(in.tellg());
+  in.seekg(0, std::ios::beg);
+  const size_t point_bytes = sizeof(float) * uniad_lidar::kPointFeatureNum;
+  uniad_lidar::require(bytes % point_bytes == 0,
+                       "Raw points byte size is not divisible by float4: " +
+                           raw_points_path);
+  const size_t num_points = bytes / point_bytes;
+  std::vector<float> raw(num_points * uniad_lidar::kPointFeatureNum);
+  in.read(reinterpret_cast<char*>(raw.data()), bytes);
+  uniad_lidar::require(static_cast<bool>(in),
+                       "Failed to read raw points for visualization: " +
+                           raw_points_path);
+
+  const size_t max_points = config.max_points < 0
+      ? num_points
+      : static_cast<size_t>(config.max_points);
+  const size_t stride =
+      std::max<size_t>(1, num_points / std::max<size_t>(1, max_points));
+  std::vector<uniad_lidar::BevPoint> points;
+  points.reserve(std::min(num_points, max_points));
+  for (size_t i = 0; i < num_points && points.size() < max_points; i += stride) {
+    const float x = raw[i * uniad_lidar::kPointFeatureNum + 0];
+    const float y = raw[i * uniad_lidar::kPointFeatureNum + 1];
+    if (x < config.xy_range[0] || x > config.xy_range[2] ||
+        y < config.xy_range[1] || y > config.xy_range[3]) {
+      continue;
+    }
+    points.push_back({x, y});
+  }
+  return points;
+}
+
+uniad_lidar::DrivableScoreMap drivable_score_map_from_tensor(
+    const uniad_lidar::NamedTensor& tensor,
+    float threshold) {
+  uniad_lidar::require(tensor.dtype == TensorRT::DType::FLOAT ||
+                           tensor.dtype == TensorRT::DType::HALF,
+                       "drivable_score must be a float TensorRT output.");
+  uniad_lidar::require(!tensor.data.empty(),
+                       "drivable_score output tensor is empty.");
+  uniad_lidar::require(tensor.shape.size() == 2 || tensor.shape.size() == 3,
+                       "drivable_score must have shape HxW or 1xHxW.");
+  int height = 0;
+  int width = 0;
+  if (tensor.shape.size() == 2) {
+    height = static_cast<int>(tensor.shape[0]);
+    width = static_cast<int>(tensor.shape[1]);
+  } else {
+    uniad_lidar::require(tensor.shape[0] == 1,
+                         "drivable_score batch dimension must be 1.");
+    height = static_cast<int>(tensor.shape[1]);
+    width = static_cast<int>(tensor.shape[2]);
+  }
+  uniad_lidar::require(height > 0 && width > 0,
+                       "drivable_score has invalid dimensions.");
+  uniad_lidar::require(tensor.data.size() ==
+                           static_cast<size_t>(height * width),
+                       "drivable_score data size does not match shape.");
+  uniad_lidar::DrivableScoreMap map;
+  map.data = tensor.data;
+  map.height = height;
+  map.width = width;
+  map.threshold = threshold;
+  return map;
+}
+
+void write_drivable_mask_pgm(
+    const std::string& path,
+    const uniad_lidar::DrivableScoreMap& map) {
+  uniad_lidar::require(map.height > 0 && map.width > 0,
+                       "Cannot write empty drivable mask.");
+  uniad_lidar::require(map.data.size() ==
+                           static_cast<size_t>(map.height * map.width),
+                       "Drivable mask data size does not match dimensions.");
+  std::ofstream out(path, std::ios::binary);
+  uniad_lidar::require(static_cast<bool>(out),
+                       "Failed to open drivable mask output: " + path);
+  out << "P5\n" << map.width << ' ' << map.height << "\n255\n";
+  for (float score : map.data) {
+    const unsigned char value =
+        score > map.threshold ? static_cast<unsigned char>(255)
+                              : static_cast<unsigned char>(0);
+    out.write(reinterpret_cast<const char*>(&value), 1);
+  }
+  uniad_lidar::require(static_cast<bool>(out),
+                       "Failed to write drivable mask output: " + path);
 }
 
 uniad_lidar::BevGridSpec bev_grid_from_track_engine(
@@ -544,6 +653,14 @@ CliArgs parse_cli(int argc, char** argv) {
       uniad_lidar::require(cursor < argc,
                            "--bev-score-threshold requires a value.");
       args.bev_visualization_config.min_score = std::atof(argv[cursor++]);
+    } else if (option == "--bev-max-points") {
+      uniad_lidar::require(cursor < argc,
+                           "--bev-max-points requires a value.");
+      args.bev_visualization_config.max_points = std::atoi(argv[cursor++]);
+    } else if (option == "--drivable-threshold") {
+      uniad_lidar::require(cursor < argc,
+                           "--drivable-threshold requires a value.");
+      args.drivable_threshold = std::atof(argv[cursor++]);
     } else {
       usage(argv[0]);
       uniad_lidar::fail("Unknown option: " + option);
@@ -583,6 +700,19 @@ int main(int argc, char** argv) {
       TensorRT::load(args.track_engine_path);
   uniad_lidar::require(static_cast<bool>(track_engine),
                        "Failed to load LiDAR track TensorRT engine.");
+  const bool has_drivable_score =
+      engine_has_tensor(track_engine, "drivable_score");
+#ifdef UNIAD_LIDAR_TRACK_DRIVABLE_REQUIRED
+  uniad_lidar::require(
+      has_drivable_score,
+      "uniad_lidar_track_drivable requires a drivable_score output.");
+#endif
+  std::vector<std::string> output_names = track_output_names();
+  if (has_drivable_score) {
+    output_names.push_back("drivable_score");
+    std::printf("[INFO] track engine exposes drivable_score; "
+                "drivable outputs will be written.\n");
+  }
 
   const size_t prev_numel =
       static_cast<size_t>(track_engine->numel("prev_bev"));
@@ -716,9 +846,10 @@ int main(int argc, char** argv) {
     uniad_lidar::TensorMap outputs = uniad_lidar::run_track_lidar_trt(
         track_engine,
         track_input,
-        track_output_names(),
+        output_names,
         stream,
-        "LiDAR Track TensorRT",
+        has_drivable_score ? "LiDAR Track+Drivable TensorRT"
+                           : "LiDAR Track TensorRT",
         frame == 0,
         args.max_track_state_len,
         std::max(args.decode_config.max_num, 300));
@@ -743,6 +874,25 @@ int main(int argc, char** argv) {
       uniad_lidar::write_bev_svg(prefix + "_bev.svg",
                                  detections,
                                  args.bev_visualization_config);
+    }
+    if (has_drivable_score) {
+      uniad_lidar::write_raw_tensor(prefix + "_drivable_score.bin",
+                                    outputs.at("drivable_score"));
+      const uniad_lidar::DrivableScoreMap drivable =
+          drivable_score_map_from_tensor(outputs.at("drivable_score"),
+                                         args.drivable_threshold);
+      write_drivable_mask_pgm(prefix + "_drivable_mask.pgm", drivable);
+      if (args.write_visualization) {
+        const std::vector<uniad_lidar::BevPoint> points =
+            read_bev_points_for_visualization(
+                raw_points_path, args.bev_visualization_config);
+        uniad_lidar::write_bev_drivable_svg(
+            prefix + "_drivable.svg",
+            detections,
+            drivable,
+            points,
+            args.bev_visualization_config);
+      }
     }
     if (args.write_visualization && !args.gt_detections_input.empty()) {
       const std::string gt_path = resolve_gt_detections_path(
