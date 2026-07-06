@@ -453,3 +453,95 @@ TensorRT。因此：
   暴露问题，比 prefer 更确定。
 - full-fp32 fallback 同样需在 Orin 重建。
 
+## 10. 治本修复：origin-shift 消除全局坐标 FP16 抵消（推荐首选）
+
+第 9 节把 NaN 定位到 map 分支，但用的仍是"FP32 兜底"这类数值创可贴。进一步追问"map
+分支到底哪一步在 FP16 下坏掉"，得到根因并做了治本修复。
+
+### 10.1 根因：全局坐标的灾难性抵消
+
+`MapLaneEncoderTRT._transform_to_ego` 把 HD-map 点从全局坐标系变换到 ego 系：
+
+```python
+return (points - trans2).matmul(rot2)
+```
+
+`points`（map 点全局坐标）和 `trans2`（ego 全局平移）都是 ~2000-3340 m 量级。两个
+~3000 的数相减得到 ego 系 ~百米内的局部坐标，这是**灾难性抵消**：FP16 在 3000 量级的
+ULP ~2 m，操作数各自已被量化到 ±2 m 格点，相减结果带米级噪声。实测：
+
+```text
+map 坐标范围:                1995.7 .. 3340.6 m   (不溢出 FP16 65504，排除 inf 假设)
+(points - ego) FP16 误差:    max 1.67 m   mean 0.52 m   (含旋转)
+FP16 在 ~3000 处 ULP:        ~2 m
+```
+
+劣化的 ego 系坐标接着喂进 TopK / 归一化 / map cross-attention，误差被放大最终使 sdc_traj
+变 NaN。**这不是 attention 本身不稳，是它的输入在 FP16 下已经坏了。** 排除项：
+`pos2posemb2d` 的 `dim_t` 范围 1..8660，不溢出，非主因。
+
+### 10.2 修复：常数参考原点（math-identity）
+
+在 `map_lane_encoder.py` 引入常数原点 `o`（map 质心），利用恒等式：
+
+```text
+(p - t) == (p - o) - (t - o)
+```
+
+- `p - o`（map 点侧，常数）在 `__init__` 用 float64 精确算好、烧进 buffer；
+- `t - o`（ego 侧，2 元素）在运行时先以 FP32 计算再 cast，不在 FP16 做大数相减；
+- 进图张量从 ~3000 m 缩到 ~144 m，FP16 ULP 相应从 ~2 m 降到 ~0.06 m。
+
+改动文件（部署树；训练树 `MapLaneEncoder` 用 numpy float64 主机端变换，天然精确，无需
+改）：
+
+```text
+UniAD/projects/mmdet3d_plugin/uniad/dense_heads/motion_head_plugin/map_lane_encoder.py
+  __init__:          注册 map_origin buffer，map_central/left/right 存 shift 后坐标
+  _transform_to_ego: (trans - origin) 在 fp32 域计算后再 cast
+```
+
+### 10.3 数值验证（不需 GPU）
+
+```text
+[fp32] 新旧变换 max/mean 误差 = 0.000e+00   (bit 级恒等，不影响精度、无需重训)
+[fp16] 旧路径 vs fp32-truth:  max 1.67  mean 0.52  m
+[fp16] 新路径 vs fp32-truth:  max 0.19  mean 0.029 m   (mean 改善 ~18x)
+```
+
+checkpoint 只含学习权重（`point_mlp.*`/`lane_proj.*`），不含 map buffer，故 `load_state_dict`
+不会覆盖 shift；新增 `map_origin` 与既有 `map_central` 同为 map 文件构建的 buffer，行为一致。
+
+### 10.4 端到端验证：裸 FP16、零 FP32 约束
+
+重新导出 ONNX（docker `uniad_torch1.12`，命令同 12.2 节，`--onnx-file` 换
+`..._originshift.onnx`）。新 ONNX 中 `map_central` 已 shift（|val| ≤ 557，原 ~3340），
+`map_origin` buffer 存在（~2185-2934）。裸 `--fp16` engine build PASSED，10 帧 runtime：
+
+```text
+engine                          fp32层数  finite  vs full-fp32 max/mean(m)
+full-fp32                       全部       ✓       基准
+attnfp32 (1101, 历史大锤)        1101       ✓       0.0912 / 0.0165
+mapisland69 (69, 创可贴)         69         ✓       0.0676 / 0.0141
+originshift bare-fp16 (治本)     0          ✓       0.0958 / 0.0162
+```
+
+治本版 vs mapisland69 仅 max 0.051 / mean 0.006 m，本质同一轨迹。**裸 FP16 全 finite 直接
+反证根因**：强制 FP32 不再必要，问题在坐标不在精度模式。
+
+产物：
+
+```text
+ONNX:   UniAD/onnx/base_e2e_lidar_plan_mapfuse_trt_epoch6_originshift.repaired.onnx
+engine: UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_originshift_barefp16.engine
+output: UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_originshift_barefp16_20260706/
+```
+
+### 10.5 建议与边界
+
+- **首选 origin-shift 裸 FP16**：无精度约束、engine 最简单、对 Orin 迁移最友好（不必维护绑定
+  ONNX 的 69 节点 spec，无 `--precisionConstraints` 跨平台不确定性）。
+- mapisland69 / attnfp32 降为"不想改模型代码或重导出"时的备选。
+- 诚实边界：① 仍为 10 帧 smoke test，非正式精度指标；② 未逐点用 debug tensor 抓首个 NaN
+  节点——但裸 FP16 通过等于反证根因，不必再抓；③ Orin 上仍需重建并用实际 bin 复核 finite。
+
