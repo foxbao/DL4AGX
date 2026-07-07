@@ -20,6 +20,7 @@
 #include <numeric>
 #include <utility>
 
+#include "gpu_voxelize.hpp"
 #include "onnx-parser.hpp"
 #include "spconv/engine.hpp"
 #include "spconv/tensor.hpp"
@@ -508,6 +509,24 @@ SparseEncoder::SparseEncoder(const std::string& onnx_path, cudaStream_t stream) 
   if (use_int8) {
     std::printf("[SPARSE] built libspconv engine with Precision::Int8\n");
   }
+
+  if (std::getenv("SPARSE_LIDAR_GPU_VOXEL") != nullptr) {
+    GpuVoxelizeConfig vc{};
+    for (int i = 0; i < 6; ++i) vc.range[i] = kPointCloudRange[i];
+    for (int i = 0; i < 3; ++i) vc.voxel_size[i] = kVoxelSize[i];
+    vc.grid[0] = static_cast<int>(std::round(
+        (kPointCloudRange[3] - kPointCloudRange[0]) / kVoxelSize[0]));
+    vc.grid[1] = static_cast<int>(std::round(
+        (kPointCloudRange[4] - kPointCloudRange[1]) / kVoxelSize[1]));
+    vc.grid[2] = static_cast<int>(std::round(
+        (kPointCloudRange[5] - kPointCloudRange[2]) / kVoxelSize[2]));
+    vc.max_voxels = kMaxVoxels;
+    vc.max_points_per_voxel = kMaxPointsPerVoxel;
+    vc.feature_num = kPointFeatureNum;
+    gpu_voxelizer_.reset(new GpuVoxelizer(vc));
+    std::printf("[SPARSE] GPU voxelizer enabled (grid %dx%dx%d)\n",
+                vc.grid[2], vc.grid[1], vc.grid[0]);
+  }
 }
 
 SparseEncoder::~SparseEncoder() = default;
@@ -527,7 +546,31 @@ std::vector<float> SparseEncoder::forward(
 
   // Split timing: voxelize (disk read + CPU hashing) vs spconv GPU forward.
   const auto t_begin = std::chrono::steady_clock::now();
-  if (sparse_input.use_raw_points) {
+  if (sparse_input.use_raw_points && gpu_voxelizer_) {
+    // GPU voxelization path: read points to host, voxelize on GPU, feed the
+    // device features/coors straight into spconv (no CPU hashing, no separate
+    // H2D of voxel outputs).
+    const std::vector<float> points =
+        read_all_raw_float(sparse_input.raw_points_path);
+    const size_t num_points = points.size() / kPointFeatureNum;
+    void* gpu_features = nullptr;
+    void* gpu_coors = nullptr;
+    size_t gpu_num_voxels = 0;
+    check_cuda(gpu_voxelizer_->voxelize(points.data(), num_points, stream,
+                                        &gpu_features, &gpu_coors,
+                                        &gpu_num_voxels),
+               "GpuVoxelizer::voxelize");
+    feature_shape = {static_cast<int64_t>(gpu_num_voxels), kPointFeatureNum};
+    index_shape = {static_cast<int64_t>(gpu_num_voxels), 4};
+    feature_ptr = gpu_features;
+    index_ptr = gpu_coors;
+    std::printf("raw points: %zu x %d from %s (GPU voxelize)\n",
+                num_points, kPointFeatureNum,
+                sparse_input.raw_points_path.c_str());
+    std::printf("generated sparse input: %zu voxels, max_points_per_voxel=%d, "
+                "max_voxels=%d\n",
+                gpu_num_voxels, kMaxPointsPerVoxel, kMaxVoxels);
+  } else if (sparse_input.use_raw_points) {
     RawVoxelInput raw_input = voxelize_raw_points(sparse_input.raw_points_path);
     raw_features_device.reset(raw_input.features_half.size() * sizeof(uint16_t));
     raw_indices_device.reset(raw_input.coors.size() * sizeof(int32_t));

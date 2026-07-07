@@ -293,6 +293,43 @@ spconv backbone 大得多、GPU 计算占主导，INT8 才划算；此处 sparse
 spconv（能量化不加速）三部件全部实测——**对这个 pipeline，INT8 无有意义的总加速**，
 因为 GPU 计算本就不是瓶颈（瓶颈是 IO/CPU 体素化 + host 拷贝，见 §9.7）。
 
+## 9.9 GPU 体素化:把 45ms CPU 瓶颈干到 ~9.5ms（真正有效的加速）
+
+§9.7 定位到 pipeline 真瓶颈是 CPU 体素化（`voxelize_raw_points` 的 unordered_map
+哈希 + mean-VFE，~45ms/帧）。借鉴 NVIDIA CUDA-PointPillars 的 GPU 体素化机制
+（dense 网格 + atomicAdd，`~/Downloads/public_code/CUDA-PointPillars`），改造成
+**3D voxel + mean-VFE**（PointPillars 是 2D pillar + 10 维特征，这里是 3D voxel +
+4 维均值），实现自包含的 GPU kernel。
+
+实现（`inference_app/sparse_lidar/src/gpu_voxelize.cu` + `include/gpu_voxelize.hpp`）：
+- kernel1 `scatter`：每点一线程，算 3D cell `(cz*gy+cy)*gx+cx`，atomicAdd 到 dense
+  count + atomicAdd 累加特征到 dense featsum（cap max_points_per_voxel）；
+- kernel2 `compact`：每 cell 一线程，count>0 的 atomicAdd 抢紧凑 voxel id，写
+  mean 特征（fp16）+ coors `{0,cz,cy,cx}`，直接输出 device 指针给 spconv（省 H2D）。
+- dense 缓冲：count 50.4M×4B≈200MB + featsum ×4≈800MB，每帧 memsetAsync 清零复用。
+- runtime 开关 `SPARSE_LIDAR_GPU_VOXEL=1`（默认走 CPU，不影响现有路径）。
+
+实测（SM89，10 帧）：
+
+```text
+                      CPU(unordered_map)   GPU(dense+atomicAdd)
+voxelize + H2D/frame   ~45 ms               ~9.5 ms   -> ~4.7x
+voxel 数               124329               124329    完全一致
+lidar_bev vs CPU       —                    mean|Δ|=0.0005, max|Δ|~0.3-0.6
+检测数                  4 tracks             4 tracks  一致
+```
+
+数值差异来源：4.2% 的 voxel 点数 >10（最多 1773 点），被 cap 到 10 个点求均值时
+**CPU 取遍历顺序前 10、GPU 取 atomic 并发顺序前 10 → 选的 10 个点不同 → 均值略不同**。
+95.8% 的 voxel（≤10 点）完全一致。这是语义可接受的差异（cap 选点本无顺序保证），
+非 bug；下游检测数一致。
+
+**这是本会话第一个真正有效的加速**：不同于 INT8（收益存疑），GPU 体素化实打实把
+pipeline 大头之一 45→9.5ms，且是纯 CUDA kernel，对 Orin 同样有效。剩余 ~9.5ms 含磁盘
+读点云 + H2D（kernel 本身应 <2ms），若要进一步压可 pin-memory / 异步读点云——另做。
+
+产物：`gpu_voxelize.{cu,hpp}`、CMake 加 CUDA 语言。日志：`UniAD/logs/gpu_voxel_probe.log`。
+
 ## 10. 三部件总览（INT8 适用性）
 
 ```text

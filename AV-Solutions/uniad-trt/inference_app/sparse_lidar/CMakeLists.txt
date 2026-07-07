@@ -1,9 +1,15 @@
 cmake_minimum_required(VERSION 3.16)
-project(uniad_sparse_lidar LANGUAGES CXX)
+project(uniad_sparse_lidar LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_BUILD_TYPE Release)
+
+# GPU voxelizer (.cu) arch. Override with -DTARGET_GPU_SM=87 for Orin.
+if(NOT TARGET_GPU_SM)
+  set(TARGET_GPU_SM 89)
+endif()
+set(CMAKE_CUDA_ARCHITECTURES ${TARGET_GPU_SM})
 
 set(DEFAULT_SPARSE_CONV_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../dependencies/3DSparseConvolution)
 if(NOT SPARSE_CONV_ROOT)
@@ -137,6 +143,7 @@ if(TENSORRT_PATH)
   set(ENQUEUE_V3_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../enqueueV3)
   add_library(sparse_lidar_trt_runtime STATIC
     src/lidar_runtime.cpp
+    src/gpu_voxelize.cu
     src/lidar_postprocess.cpp
     src/lidar_bev_visualizer.cpp
     src/lidar_metadata.cpp

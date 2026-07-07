@@ -131,6 +131,9 @@ class SparseEncoder {
 
  private:
   std::shared_ptr<spconv::Engine> engine_;
+  // Optional GPU voxelizer (enabled by env SPARSE_LIDAR_GPU_VOXEL=1); replaces
+  // the CPU unordered_map voxelization. Opaque to keep CUDA headers out here.
+  std::unique_ptr<class GpuVoxelizer> gpu_voxelizer_;
 };
 
 std::vector<float> run_sparse_encoder(
