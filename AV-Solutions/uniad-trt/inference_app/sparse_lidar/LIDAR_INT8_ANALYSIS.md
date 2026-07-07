@@ -195,6 +195,69 @@ Q/DQ + trtexec 量化流程**对它不适用**。事实：
 不在 TensorRT 显式量化范围内。若要评估，需单独调研 libspconv 的 INT8 稀疏卷积支持并
 准备其专用校准，属于另一项工作。
 
+## 9.5 Deformable attention plugin 的 INT8:能，但需要 QAT 重训
+
+进一步核实 dense 瓶颈 `MultiScaleDeformableAttnTRT` 到底能不能 INT8：
+
+**plugin 本身支持 INT8。** 源码 `UniAD/plugins/plugin/multi_scale_deformable_attn/
+multiScaleDeformableAttnPlugin.cpp`：
+- `enqueue` 有 `kINT8` 分支 → `ms_deformable_im2col_cuda_int8`（value/offset/weight
+  走 int8_4，带 scale_value/scale_offset/scale_weight/scale_out）；
+- `supportsFormatCombination` 声明 value 支持 INT8，前提 `channels%4==0 &&
+  point_num%4==0`；本模型 channels=256/8=32、point_num∈{4,8}，**前提全满足**。
+  （plugin 来自 [DerryHub/BEVFormer_tensorrt](https://github.com/DerryHub/BEVFormer_tensorrt)，
+  该项目实现了 float/half/half2/int8 四套 kernel。）
+
+**但现有 ModelOpt PTQ 链路触发不了它**（三次尝试全失败）：
+1. `--trt_plugins_precision` 只支持 fp32/fp16，**无 int8** 选项；
+2. `--nodes_to_quantize` 点名 plugin value 上游的 Reshape → 量化 0 个节点
+   （Reshape 是形状算子，modelopt 不量化）；
+3. 点名上游 Add → 插了 Q/DQ 但 `qdq_to_dq` 转换崩溃
+   （`tuple index out of range`，modelopt 处理不了 plugin 前的 Q/DQ 位置）。
+
+**根因**：ModelOpt 是为标准 ONNX 算子设计的 PTQ 工具，不支持给自定义 plugin 喂 INT8
+输入。plugin INT8 需要 value/offset/weight 都是 int8+scale，这套只有 BEVFormer_tensorrt
+原生的 `pytorch_quantization` **QAT** 流程能正确生成（PyTorch 侧手动包 QuantModule）。
+
+**且精度是大风险**：QD-BEV 实测量化 BEVFormer encoder 令 mAP 从 0.416 掉到 0.160
+（-62%）。所以必须 **QAT（重训）**而非 PTQ 才能保精度。
+
+**结论**：deformable attention 的 INT8 提速 = 引入 pytorch_quantization + 改模型代码包
+QuantModule + **QAT 重训** + 精度调优，是独立立项级工程，本会话不做。若 Orin FP16 缺口
+不大不值得；缺口大且必须 INT8 才专门做。
+
+## 9.7 分阶段计时:pipeline 真瓶颈是 IO/CPU，不是 GPU 计算
+
+给 `uniad_lidar_e2e` runtime 加了分阶段 GPU 计时（每段后 cudaStreamSynchronize），
+并把 sparse encoder 内部进一步拆成"体素化(IO/CPU)"vs"spconv GPU forward"。
+10 帧、frame0 排除，本机 SM89：
+
+```text
+三段墙钟(含 IO/CPU/host 拷贝) ms/frame:
+  sparse encoder : 339   (69%)   <- 其中体素化+H2D ~45ms, spconv GPU 仅 ~2.3ms
+  backbone+neck  :  40   ( 8%)
+  dense e2e      : 111   (23%)
+sparse 内部拆分(每帧):
+  voxelize + H2D (磁盘读42万点 + CPU哈希体素化): ~45 ms
+  spconv GPU forward:                            ~2.3 ms   <- 真正的 GPU 计算
+```
+
+**关键发现**：
+- 上面的墙钟大头是 **IO / CPU / host-device 拷贝**，不是 GPU 计算。纯 GPU 计算三段
+  合计只有 ~10.5ms（spconv ~2.3 + backbone ~0.43 + dense ~7.76，后两者取 trtexec 纯
+  GPU 值）。
+- sparse encoder 段 339ms 里，**spconv 的 GPU 计算只占 ~2.3ms**，前面的体素化 IO/CPU
+  占 ~45ms（20×）。
+- 因此 pipeline 的真瓶颈是**体素化(CPU) + host 内存拷贝**，INT8 对这些无能为力。
+
+**对 spconv INT8 的意义**：量化 spconv 最多优化那 ~2.3ms 的 GPU 计算，端到端收益很小。
+若要提速，方向是优化 CPU 体素化 / 减少 host↔device 拷贝 / 优化 dense 的 deformable
+attention plugin，而非 INT8。（体素化优化由团队另行处理；spconv INT8 仍按需推进，见
+`LIDAR_SPCONV_INT8.md`。）
+
+计时代码：`inference_app/sparse_lidar/src/uniad_lidar_e2e.cpp`（三段 STAGE TIMING）+
+`src/lidar_runtime.cpp`（SPARSE SPLIT）。日志：`UniAD/logs/stage_timing_probe2.log`。
+
 ## 10. 三部件总览（INT8 适用性）
 
 ```text

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -63,6 +64,9 @@ std::vector<std::string> e2e_output_names(
       "valid_traj_masks"};
   if (engine_has_tensor(engine, "sdc_traj")) {
     names.push_back("sdc_traj");
+  }
+  if (engine_has_tensor(engine, "seg_out")) {
+    names.push_back("seg_out");
   }
   return names;
 }
@@ -649,6 +653,18 @@ int main(int argc, char** argv) {
                 "--gt-detections will not produce comparison SVGs.\n");
   }
 
+  // Per-stage GPU timing (diagnostic). Sync after each stage so the measured
+  // interval is that stage's GPU execution, not just CPU submission. Frame 0
+  // excluded from averages (engine warm-up / first-touch allocs).
+  auto now_ms = [&]() {
+    cudaStreamSynchronize(stream);
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  };
+  double t_sparse = 0.0, t_backbone = 0.0, t_dense = 0.0;
+  int timed_frames = 0;
+
   for (int frame = 0; frame < args.num_frames; ++frame) {
     const std::string raw_points_path = resolve_raw_points_path(
         args.raw_points_input, frame, args.num_frames);
@@ -710,10 +726,12 @@ int main(int argc, char** argv) {
     uniad_lidar::SparseInputSpec sparse_input;
     sparse_input.use_raw_points = true;
     sparse_input.raw_points_path = raw_points_path;
+    const double ts0 = now_ms();
     std::vector<float> middle_bev = sparse_encoder.forward(
         sparse_input, args.grid_size, stream);
     middle_bev = adapt_middle_bev_for_frontend(
         middle_bev, static_cast<size_t>(frontend_engine->numel("middle_bev")));
+    const double ts1 = now_ms();  // end sparse encoder
 
     std::vector<float> lidar_bev = uniad_lidar::run_single_input_trt(
         frontend_engine,
@@ -723,6 +741,7 @@ int main(int argc, char** argv) {
         middle_bev,
         stream,
         frame == 0);
+    const double ts2 = now_ms();  // end backbone+neck
 
     uniad_lidar::TrackLidarInput track_input;
     track_input.lidar_bev = lidar_bev;
@@ -750,6 +769,14 @@ int main(int argc, char** argv) {
         frame == 0,
         args.max_track_state_len,
         std::max(args.decode_config.max_num, 300));
+    const double ts3 = now_ms();  // end dense e2e
+
+    if (frame > 0) {  // skip warm-up frame
+      t_sparse += ts1 - ts0;
+      t_backbone += ts2 - ts1;
+      t_dense += ts3 - ts2;
+      ++timed_frames;
+    }
 
     const std::string prefix = output_prefix(args.output_dir, frame);
     uniad_lidar::write_raw_float(prefix + "_lidar_bev.bin", lidar_bev);
@@ -802,6 +829,21 @@ int main(int argc, char** argv) {
     std::printf("[INFO] frame %d outputs written with prefix %s "
                 "(%zu tracks, max_obj_id=%d)\n",
                 frame, prefix.c_str(), detections.size(), max_obj_id[0]);
+  }
+
+  if (timed_frames > 0) {
+    const double s = t_sparse / timed_frames;
+    const double b = t_backbone / timed_frames;
+    const double d = t_dense / timed_frames;
+    const double tot = s + b + d;
+    std::printf(
+        "\n[STAGE TIMING] avg over %d frames (frame 0 excluded), ms/frame:\n"
+        "  sparse encoder : %8.3f  (%5.1f%%)\n"
+        "  backbone+neck  : %8.3f  (%5.1f%%)\n"
+        "  dense e2e      : %8.3f  (%5.1f%%)\n"
+        "  3-stage total  : %8.3f\n",
+        timed_frames, s, 100.0 * s / tot, b, 100.0 * b / tot,
+        d, 100.0 * d / tot, tot);
   }
 
   uniad_lidar::check_cuda(cudaStreamDestroy(stream), "cudaStreamDestroy");

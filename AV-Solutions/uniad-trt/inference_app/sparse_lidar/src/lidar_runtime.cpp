@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -513,6 +514,8 @@ std::vector<float> SparseEncoder::forward(
   void* feature_ptr = nullptr;
   void* index_ptr = nullptr;
 
+  // Split timing: voxelize (disk read + CPU hashing) vs spconv GPU forward.
+  const auto t_begin = std::chrono::steady_clock::now();
   if (sparse_input.use_raw_points) {
     RawVoxelInput raw_input = voxelize_raw_points(sparse_input.raw_points_path);
     raw_features_device.reset(raw_input.features_half.size() * sizeof(uint16_t));
@@ -549,6 +552,7 @@ std::vector<float> SparseEncoder::forward(
     index_ptr = indices.ptr();
   }
   check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(load-sparse)");
+  const auto t_voxel_done = std::chrono::steady_clock::now();
 
   std::printf("libspconv version: %s\n", NVSPCONV_VERSION);
   std::printf("sparse features: %s dtype=%s\n",
@@ -565,9 +569,18 @@ std::vector<float> SparseEncoder::forward(
   engine_->input(0)->indices().reference(
       index_ptr, index_shape, spconv::DataType::Int32);
   engine_->input(0)->set_grid_size(grid_size);
+  const auto t_spconv_begin = std::chrono::steady_clock::now();
   engine_->forward(stream);
   check_cuda(cudaStreamSynchronize(stream),
              "cudaStreamSynchronize(sparse-forward)");
+  const auto t_spconv_done = std::chrono::steady_clock::now();
+  {
+    using ms = std::chrono::duration<double, std::milli>;
+    std::printf("[SPARSE SPLIT] voxelize+H2D: %.3f ms | spconv GPU forward: "
+                "%.3f ms\n",
+                ms(t_voxel_done - t_begin).count(),
+                ms(t_spconv_done - t_spconv_begin).count());
+  }
 
   spconv::Tensor& output_device = engine_->output(0)->features();
   std::printf("sparse dense output: %s dtype=%s\n",
