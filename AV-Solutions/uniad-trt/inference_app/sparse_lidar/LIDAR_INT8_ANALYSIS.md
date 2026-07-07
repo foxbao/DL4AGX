@@ -1,25 +1,33 @@
-# LiDAR 版 INT8 部署可行性与测速分析
+# LiDAR 版部署提速分析：INT8 可行性 + GPU 体素化
 
-本文档记录给 **LiDAR 部署路径**（track/e2e 等）做 TensorRT INT8 显式量化
-（ModelOpt Q/DQ）的可行性侦察、实际量化流程、以及 dense engine 的 INT8-vs-FP16
-测速结论。动机：评估 Orin 上 FP16 可能不够快时，INT8 能带来多少加速。
+本文档记录 **LiDAR 部署路径**（track/e2e 等）的提速探索。动机：评估 Orin 上 FP16 可能
+不够快时怎么提速。两条主线：
+1. **TensorRT INT8**（ModelOpt Q/DQ）——三部件（前端 Conv / dense track head / spconv）
+   全部实测，结论是 INT8 帮助有限（§1–§9.8、§10）。
+2. **分阶段计时定位真瓶颈 + GPU 体素化**——发现瓶颈是 CPU 体素化而非 GPU 计算，用 GPU
+   3D 体素化把它从 45ms 干到 9.5ms（§9.7、§9.9），**这是真正有效的加速**。
+
+当前状态与后续见 §11。
 
 结论先行（本机 SM89 实测）：
 
-| 部件 | FP16 | INT8 | 加速 | 占 pipeline | INT8 有效? |
-|---|---|---|---|---|---|
-| backbone+neck 前端（纯 Conv） | 0.427 ms | 0.236 ms | **1.8×** | 小 | ✅ 有效但占比小 |
-| dense engine（track head） | 7.76 ms | 7.86 ms | 无（噪声内） | **大头** | ❌ 无效 |
-| sparse encoder（libspconv） | 见 §9 | — | — | 中 | ⚠️ 不走 TRT 量化 |
+| 部件 | FP16 | INT8 | 加速 | INT8 有效? |
+|---|---|---|---|---|
+| backbone+neck 前端（纯 Conv） | 0.427 ms | 0.236 ms | **1.8×** | ✅ 有效但绝对耗时/占比小 |
+| dense engine（track head） | 7.76 ms | 7.86 ms | 无（噪声内） | ❌ 无效（plugin 瓶颈，需 QAT） |
+| sparse encoder（libspconv） | 2.3 ms | 2.6 ms | 无 | ❌ 能 build 不加速（索引瓶颈，§9.8） |
 
-- **dense engine INT8 不加速**：瓶颈在**无法量化的 plugin**（18 个
-  `MultiScaleDeformableAttnTRT`）+ 被排除的 attention MatMul，INT8 只吃到少量
-  Gemm/Conv，加速被 Q/DQ 开销抵消。
-- **前端 backbone+neck INT8 有效（1.8×）**：纯 Conv，13 Conv 全部量化。但它在整个
-  pipeline 里占比小，省下的 ~0.19ms 相对 dense 的 7.76ms，对端到端 <3%。
-- **总结论**：INT8 加速集中在占比小的前端，对占大头的 dense engine 无效 →
-  **INT8 对整个 LiDAR pipeline 的总加速非常有限（估计 <3%）**。若 Orin 上 FP16 不够
-  快，INT8 不是出路；真瓶颈是 dense engine 的 deformable attention plugin。
+**两条主线结论：**
+
+1. **INT8 不是这个 pipeline 的提速手段**：三部件全部实测，能被有效 INT8 加速的只有
+   占比小的前端 Conv；dense 受限于无法量化的 deformable attention plugin（要提速须
+   QAT 重训）；spconv 能 build 但不加速（瓶颈在稀疏索引非算术）。根因是 GPU 计算本就
+   不是瓶颈——纯 GPU 三段合计仅 ~10.5ms（§9.7）。
+
+2. **真瓶颈是 CPU 体素化，已用 GPU 体素化解决**：分阶段计时（§9.7）发现 pipeline 墙钟
+   大头是 CPU 体素化（~45ms/帧），不是 GPU 计算。用 GPU 3D 体素化把它干到 ~9.5ms
+   （~4.7×，§9.9）——**这才是本会话真正有效的加速**。（注：上车接 Apollo 后走通道读点云，
+   不读文件，磁盘 IO 那部分不再是问题；GPU 体素化 kernel 本身仍适用。）
 
 ## 1. 可行性前提（全部就绪）
 
@@ -251,9 +259,8 @@ sparse 内部拆分(每帧):
 - 因此 pipeline 的真瓶颈是**体素化(CPU) + host 内存拷贝**，INT8 对这些无能为力。
 
 **对 spconv INT8 的意义**：量化 spconv 最多优化那 ~2.3ms 的 GPU 计算，端到端收益很小。
-若要提速，方向是优化 CPU 体素化 / 减少 host↔device 拷贝 / 优化 dense 的 deformable
-attention plugin，而非 INT8。（体素化优化由团队另行处理；spconv INT8 仍按需推进，见
-`LIDAR_SPCONV_INT8.md`。）
+真正该做的是优化 CPU 体素化——**已在 §9.9 用 GPU 体素化做到（45→9.5ms）**。spconv INT8
+后来也实测了（§9.8：能 build 不加速）。
 
 计时代码：`inference_app/sparse_lidar/src/uniad_lidar_e2e.cpp`（三段 STAGE TIMING）+
 `src/lidar_runtime.cpp`（SPARSE SPLIT）。日志：`UniAD/logs/stage_timing_probe2.log`。
@@ -341,5 +348,24 @@ dense (track head)  TensorRT           attn/plugin/MatMul ModelOpt+trtexec 7.76�
 
 **整体判断**：三部件 INT8 全部实测——前端 Conv 能 1.8× 但绝对耗时/占比小；dense 受限
 于无法量化的 deformable attention plugin（要提速须 QAT 重训）；spconv 能量化能 build 但
-本机不加速（瓶颈在稀疏索引非算术）。**所以 INT8 无法显著降低整个 LiDAR pipeline 延迟——
-根因是 pipeline 的真瓶颈是 IO/CPU 体素化 + host 拷贝（§9.7），GPU 计算本就不是瓶颈。**
+本机不加速（瓶颈在稀疏索引非算术）。**INT8 无法显著降低整个 LiDAR pipeline 延迟。**
+
+**真正有效的优化不是 INT8，是 GPU 体素化（§9.9，已做，45→9.5ms）**——因为 pipeline 的
+大头是 CPU 体素化，GPU 计算本就不是瓶颈（§9.7）。
+
+## 11. 当前状态与后续（对齐进展）
+
+**已完成并落库：**
+- 分阶段计时（§9.7）：定位真瓶颈 = CPU 体素化 ~45ms。
+- **GPU 3D 体素化（§9.9）：45→9.5ms（~4.7×），数值与 CPU 基本一致，检测数一致。**
+  开关 `SPARSE_LIDAR_GPU_VOXEL=1`，默认 CPU 不变。**这是本会话唯一确定有效的加速。**
+- INT8 三部件全部实测并给出否定/有限结论（前端 1.8× 但小、dense 无效、spconv 无效）。
+
+**未做 / 待定（按优先级）：**
+- **dense 的 deformable attention INT8**：需 QAT 重训（pytorch_quantization 包 QuantModule
+  + 重训 + 精度调优），且 QD-BEV 实测量化 encoder mAP -62% 风险大。**独立立项级，未做。**
+  性价比说明：dense 只 7.76ms，且 pipeline 大头（体素化）已解决，QAT 收益相对更小——
+  除非 Orin 上这 7.76ms 是过不去的坎，否则不建议投入。
+- GPU 体素化剩余 ~9.5ms 里的磁盘读点云/H2D：**上车接 Apollo 走通道读点云，不读文件，此项
+  自然消失**；GPU kernel 本身（<2ms）保留。
+- 所有实测在 SM89；Orin/DriveOS 需重建 + 复测（GPU 体素化和 INT8 结论都要 on-target 复核）。
