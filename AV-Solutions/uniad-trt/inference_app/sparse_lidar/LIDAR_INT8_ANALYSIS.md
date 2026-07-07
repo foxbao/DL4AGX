@@ -258,15 +258,51 @@ attention plugin，而非 INT8。（体素化优化由团队另行处理；spcon
 计时代码：`inference_app/sparse_lidar/src/uniad_lidar_e2e.cpp`（三段 STAGE TIMING）+
 `src/lidar_runtime.cpp`（SPARSE SPLIT）。日志：`UniAD/logs/stage_timing_probe2.log`。
 
+## 9.8 spconv INT8:能量化能 build，但本机不加速（已止损）
+
+按需实测了 sparse encoder 的 libspconv INT8（PTQ，非 QAT）。libspconv INT8 是读
+ONNX SparseConvolution/Add 节点属性触发的：`precision/output_precision="int8"` +
+`weight_dynamic_ranges`（per-out-channel max|w|，静态）+ `input_dynamic_range`
+（per-tensor，PTQ 校准）。
+
+做法（`UniAD_train/UniAD/tools/spconv_int8_calibrate.py`，复用导出脚本的模型/voxelize）：
+1. weight range：从 ONNX 权重算 per-output-channel max|w|（不需数据）；
+2. input range：forward-hook 每个 spconv 层，跑 8 帧真实数据收 max|input|（不需
+   pytorch_quantization，per-tensor 标量用 hook 收 max 即可）；
+3. 把两者写进 ONNX 属性、precision 翻 int8 → 生成 INT8 sparse ONNX（21/21 层）。
+
+runtime 侧：libspconv 的 build precision 是全局开关，原本硬编码 `Precision::Float16`
+（会忽略节点 int8 属性）。加了 `SPARSE_LIDAR_INT8=1` 环境开关走 `Precision::Int8`
+（默认 FP16 不变，`lidar_runtime.cpp`）。
+
+**实测结果（止损点）**：
+- INT8 build 生效（日志 `built libspconv engine with Precision::Int8`），
+  但**跑第 1 帧 spconv = 2.611 ms，对比 FP16 ~2.3 ms，不快甚至略慢**。
+- 且完整跑通还差两处边界修正（本会话未做，因已证明不快）：
+  - **Add 残差层**要同步标 int8 + `input0/1_dynamic_range`，否则 libspconv 断言
+    `Different input dtype(Int8 != Float16)` 崩（脚本只处理了 SparseConvolution）；
+  - **最后一层 conv_out 的 output_precision 应保持 fp16**（否则输出 int8，下游
+    backbone TRT engine 报 `Unsupported sparse tensor dtype: Int8`）。
+
+**结论**：spconv INT8 技术上可行（能量化、能 build），但**本机不加速**。原因：这个
+UniAD-tiny sparse encoder 只有 21 层、GPU 仅 ~2.3ms，瓶颈在 rulebook / gather-scatter
+稀疏索引开销（INT8 加速不了），而非 conv 算术。与车上 BEVFusion 不同——BEVFusion 的
+spconv backbone 大得多、GPU 计算占主导，INT8 才划算；此处 sparse encoder 太小。
+
+**INT8 线整体收官**：dense（plugin 瓶颈，需 QAT）、前端 Conv（1.8× 但占比小）、
+spconv（能量化不加速）三部件全部实测——**对这个 pipeline，INT8 无有意义的总加速**，
+因为 GPU 计算本就不是瓶颈（瓶颈是 IO/CPU 体素化 + host 拷贝，见 §9.7）。
+
 ## 10. 三部件总览（INT8 适用性）
 
 ```text
-部件                执行引擎           算子             INT8 路径              本会话结论
-sparse encoder     libspconv(C++)     SparseConv×21    libspconv 自有(未做)    独立课题，非 TRT 量化
-backbone+neck 前端  TensorRT           Conv×13          ModelOpt+trtexec       ✅ 1.8x，但占比小
-dense (track head)  TensorRT           attn/plugin/MatMul ModelOpt+trtexec     ❌ 无加速(plugin瓶颈)
+部件                执行引擎           算子             INT8 路径          GPU耗时      本会话结论
+sparse encoder     libspconv(C++)     SparseConv×21    libspconv 属性     2.3→2.6ms    ❌ 能build不加速(索引瓶颈)
+backbone+neck 前端  TensorRT           Conv×13          ModelOpt+trtexec  0.43→0.24ms  ✅ 1.8x 但占比小
+dense (track head)  TensorRT           attn/plugin/MatMul ModelOpt+trtexec 7.76→7.86ms  ❌ 无加速(plugin瓶颈,需QAT)
 ```
 
-**整体判断**：能被 TensorRT INT8 有效加速的只有占比小的 backbone+neck 前端；占大头的
-dense 受限于 plugin 无收益；sparse encoder 需另走 libspconv。**所以 INT8 无法显著降低
-整个 LiDAR pipeline 的延迟。**
+**整体判断**：三部件 INT8 全部实测——前端 Conv 能 1.8× 但绝对耗时/占比小；dense 受限
+于无法量化的 deformable attention plugin（要提速须 QAT 重训）；spconv 能量化能 build 但
+本机不加速（瓶颈在稀疏索引非算术）。**所以 INT8 无法显著降低整个 LiDAR pipeline 延迟——
+根因是 pipeline 的真瓶颈是 IO/CPU 体素化 + host 拷贝（§9.7），GPU 计算本就不是瓶颈。**

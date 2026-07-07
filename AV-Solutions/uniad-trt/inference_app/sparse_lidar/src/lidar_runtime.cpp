@@ -494,9 +494,20 @@ RawVoxelInput voxelize_raw_points(const std::string& raw_points_path) {
 
 SparseEncoder::SparseEncoder(const std::string& onnx_path, cudaStream_t stream) {
   spconv::set_verbose(std::getenv("SPARSE_LIDAR_VERBOSE") != nullptr);
+  // Build precision is a global switch for libspconv. Default FP16; set
+  // SPARSE_LIDAR_INT8=1 to build INT8 (requires an ONNX whose SparseConvolution
+  // nodes carry precision=int8 + weight/input dynamic ranges, produced by
+  // tools/spconv_int8_calibrate.py). Kept as an env switch so the FP16 path and
+  // all existing callers are unaffected by default.
+  const bool use_int8 = std::getenv("SPARSE_LIDAR_INT8") != nullptr;
   engine_ = spconv::load_engine_from_onnx(
-      onnx_path, spconv::Precision::Float16, stream, false);
+      onnx_path,
+      use_int8 ? spconv::Precision::Int8 : spconv::Precision::Float16,
+      stream, false);
   require(static_cast<bool>(engine_), "Failed to load sparse ONNX engine.");
+  if (use_int8) {
+    std::printf("[SPARSE] built libspconv engine with Precision::Int8\n");
+  }
 }
 
 SparseEncoder::~SparseEncoder() = default;
