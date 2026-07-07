@@ -32,9 +32,13 @@ run_one() {
   ls -1 "$out"/frame_000009_* 2>/dev/null | head -20
 }
 
+# Both engines must be exported with the SAME toolchain/day so they differ ONLY
+# by the velo_update line — otherwise fp16 tactic drift pollutes the diff. The
+# _oldclean engine is the naive-formula build from parent commit e8cae5b via the
+# same export path as _velofix (see tools/export_track_old_clean.sh).
 run_one velofix  UniAD/engine/base_track_lidar_track_head_epoch2_velofix.engine \
   UniAD/output/track_velofix_ab_10f
-run_one baseline UniAD/engine/base_track_lidar_track_head_epoch2.engine \
-  UniAD/output/track_baseline_ab_10f
+run_one oldclean UniAD/engine/base_track_lidar_track_head_epoch2_oldclean.engine \
+  UniAD/output/track_oldclean_ab_10f
 
 echo "=================== DONE ==================="
