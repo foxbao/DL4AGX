@@ -7,6 +7,11 @@ TensorRT 边界跑通，暂时不把 OccHead 接入 dense engine。
 runtime 输出统一放在 `UniAD_train/UniAD/output/`；历史上生成在 `UniAD/output/`
 下的目录已经剪切到该位置。
 
+> 文档结构：§1–3 是 planning 专题背景（结论 / 新增文件 / checkpoint），§4–8 是
+> 标准部署流程（准备数据 → 导出 ONNX → 编译 Engine → C++ Runtime → 可视化），
+> §10–12 是各 checkpoint 的实测记录。mapfuse 分支的 FP16 数值问题见 §12 及
+> `MAPFUSE_FP16_NAN_ANALYSIS.md`。
+
 ## 1. 结论
 
 `base_e2e_lidar_plan.py` 继承链是：
@@ -562,7 +567,7 @@ TRACK_SHAPES="prev_track_intances0:Lx512,prev_track_intances1:Lx3,prev_track_int
 ```
 
 10 帧 runtime `sdc_traj` 全 finite，vs full-FP32 max/mean abs diff = 0.096 / 0.0162 m
-（与下方 attnfp32 大锤同量级）。裸 FP16 对 Orin/DriveOS 迁移最友好：无需维护绑定 ONNX
+（与历史 FP32 island 方案同量级）。裸 FP16 对 Orin/DriveOS 迁移最友好：无需维护绑定 ONNX
 的 FP32 节点名 spec，也没有 `--precisionConstraints` 跨平台不确定性。详见
 `MAPFUSE_FP16_NAN_ANALYSIS.md` 第 10 节。
 
@@ -575,31 +580,8 @@ TRACK_SHAPES="prev_track_intances0:Lx512,prev_track_intances1:Lx3,prev_track_int
 
 修复根因前，需在整体 `--fp16` 下把 attention / MLP 的 `MatMul/Gemm/Softmax` 和归一化的
 `ReduceMean/Pow/Sqrt/Div` 约束为 FP32（后续定位发现只需 map 分支 69 个节点即可，见
-`MAPFUSE_FP16_NAN_ANALYSIS.md` 第 9 节）。此路径仍可用作"不想改模型代码/重导出"时的
-备选：
-
-```bash
-TRT_PATH=/home/baojiali/Downloads/TensorRT-10.7.0.23
-export LD_LIBRARY_PATH="$TRT_PATH/lib:${LD_LIBRARY_PATH-}"
-MIN=601
-OPT=601
-MAX=1201
-TRACK_SHAPES="prev_track_intances0:Lx512,prev_track_intances1:Lx3,prev_track_intances3:L,prev_track_intances4:L,prev_track_intances5:L,prev_track_intances6:L,prev_track_intances8:L,prev_track_intances9:Lx10,prev_track_intances11:Lx4x256,prev_track_intances12:Lx4,prev_track_intances13:L"
-
-"$TRT_PATH/bin/trtexec" \
-  --onnx=UniAD/onnx/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp16safe.repaired.onnx \
-  --saveEngine=UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp16safe_attnfp32.engine \
-  --staticPlugins=inference_app/enqueueV3/build/libuniad_plugin.so \
-  --fp16 \
-  --precisionConstraints=prefer \
-  --layerPrecisions=MatMul*:fp32,Gemm*:fp32,Softmax*:fp32,ReduceMean*:fp32,Pow*:fp32,Sqrt*:fp32,Div*:fp32 \
-  --layerOutputTypes=MatMul*:fp32,Gemm*:fp32,Softmax*:fp32,ReduceMean*:fp32,Pow*:fp32,Sqrt*:fp32,Div*:fp32 \
-  --minShapes=${TRACK_SHAPES//L/${MIN}} \
-  --optShapes=${TRACK_SHAPES//L/${OPT}} \
-  --maxShapes=${TRACK_SHAPES//L/${MAX}} \
-  --skipInference \
-  2>&1 | tee UniAD/logs/trtexec_base_e2e_lidar_plan_mapfuse_trt_epoch6_fp16safe_attnfp32.log
-```
+`MAPFUSE_FP16_NAN_ANALYSIS.md` 第 9 节）。这些中间产物已在 2026-07-07 清理，不再作为本地
+可运行路径保留；如需复现历史方案，需要重新导出旧 ONNX 并重建对应 engine。
 
 注意：裸 `--fp16` 是否可用取决于 ONNX 是否带 origin-shift 修复。**未修复**的旧 ONNX
 （`..._fp16safe.repaired.onnx` 及更早）裸 FP16 会 `sdc_traj` 全 NaN（PyTorch dense forward
@@ -623,8 +605,6 @@ UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6.engine
 ```text
 UniAD/engine/base_e2e_lidar_plan_mapfuse_backbone_neck_epoch6.engine
 UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_originshift_barefp16.engine  # 推荐（治本，裸 fp16）
-UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_mapisland69.engine           # 备选（69 节点 fp32 island，不改代码）
-UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp16safe_attnfp32.engine     # 历史（1101 节点大锤）
 UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp32.engine                  # fallback
 ```
 
@@ -635,20 +615,20 @@ UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp32.engine                 
 ```bash
 TRT_PATH=/home/baojiali/Downloads/TensorRT-10.7.0.23
 export LD_LIBRARY_PATH="$TRT_PATH/lib:${LD_LIBRARY_PATH-}"
-OUT=UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_attnfp32_20260706
-LOG=UniAD/logs/uniad_lidar_e2e_plan_mapfuse_epoch6_10f_attnfp32_20260706.log
+OUT=UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_originshift_barefp16_20260706
+LOG=UniAD/logs/uniad_lidar_e2e_plan_mapfuse_epoch6_10f_originshift_barefp16_20260706.log
 
 rm -rf "$OUT"
 inference_app/sparse_lidar/build/uniad_lidar_e2e \
   UniAD_train/UniAD/onnx/base_e2e_lidar_plan_mapfuse_sparse_encoder_epoch6.onnx \
   UniAD/engine/base_e2e_lidar_plan_mapfuse_backbone_neck_epoch6.engine \
-  UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp16safe_attnfp32.engine \
+  UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_originshift_barefp16.engine \
   inference_app/enqueueV3/build/libuniad_plugin.so \
   UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_plan_mapfuse_deploy_data_10f \
   "$OUT" 10 \
   --metadata-json UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_plan_mapfuse_deploy_data_10f \
   --gt-detections UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_plan_mapfuse_deploy_data_10f \
-  --track-init-dir UniAD/dumped_inputs/base_e2e_lidar_plan_mapfuse_trt_trace_epoch6_fp16safe \
+  --track-init-dir UniAD/dumped_inputs/base_e2e_lidar_plan_mapfuse_trt_trace_epoch6_originshift \
   --track-state-len 601 \
   --max-track-state-len 1201 \
   --command 2 \
@@ -660,7 +640,7 @@ inference_app/sparse_lidar/build/uniad_lidar_e2e \
 输出目录：
 
 ```text
-UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_attnfp32_20260706/
+UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_originshift_barefp16_20260706/
 ```
 
 输出检查：
@@ -685,14 +665,10 @@ float32[1, 6, 2]
 抽查数值：
 
 ```text
-frame_000000_sdc_traj.bin first=[0.7432, -0.0188], last=[4.3359, -0.1506]
-frame_000001_sdc_traj.bin first=[0.8462,  0.0027], last=[5.0781, -0.0136]
-frame_000005_sdc_traj.bin first=[0.9360, -0.0082], last=[5.5703, -0.0786]
-frame_000009_sdc_traj.bin first=[1.0918,  0.0257], last=[6.6016,  0.1272]
+origin-shift bare-FP16 10-frame runtime 已验证 sdc_traj 全 finite
 all_sdc_finite: true
-global min/max: -0.1506 / 6.6016
-vs full-FP32 max abs diff:  0.0912 m
-vs full-FP32 mean abs diff: 0.0165 m
+vs full-FP32 max abs diff:  0.0958 m
+vs full-FP32 mean abs diff: 0.0162 m
 ```
 
 ### 12.5 统一可视化
@@ -711,11 +687,11 @@ Chrome 截 SVG、临时 matplotlib overlay、单独 planning overlay 等多套�
 
 ```bash
 python inference_app/sparse_lidar/visualize_e2e_outputs.py \
-  UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_attnfp32_20260706 \
+  UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_originshift_barefp16_20260706 \
   --data-dir UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_plan_mapfuse_deploy_data_10f \
   --gt-dir UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_plan_mapfuse_deploy_data_10f \
   --num-frames 10 \
-  --tag base_e2e_lidar_plan_mapfuse_10f_epoch6_attnfp32_20260706 \
+  --tag base_e2e_lidar_plan_mapfuse_10f_epoch6_originshift_barefp16_20260706 \
   --modes pred compare motion motion_compare planning all \
   --width 1200 \
   --height 900 \
@@ -726,12 +702,12 @@ python inference_app/sparse_lidar/visualize_e2e_outputs.py \
 统一输出：
 
 ```text
-base_e2e_lidar_plan_mapfuse_10f_epoch6_attnfp32_20260706_pred_fixed.webm
-base_e2e_lidar_plan_mapfuse_10f_epoch6_attnfp32_20260706_compare_fixed.webm
-base_e2e_lidar_plan_mapfuse_10f_epoch6_attnfp32_20260706_motion_fixed.webm
-base_e2e_lidar_plan_mapfuse_10f_epoch6_attnfp32_20260706_motion_compare_fixed.webm
-base_e2e_lidar_plan_mapfuse_10f_epoch6_attnfp32_20260706_planning_fixed.webm
-base_e2e_lidar_plan_mapfuse_10f_epoch6_attnfp32_20260706_all_fixed.webm
+base_e2e_lidar_plan_mapfuse_10f_epoch6_originshift_barefp16_20260706_pred_fixed.webm
+base_e2e_lidar_plan_mapfuse_10f_epoch6_originshift_barefp16_20260706_compare_fixed.webm
+base_e2e_lidar_plan_mapfuse_10f_epoch6_originshift_barefp16_20260706_motion_fixed.webm
+base_e2e_lidar_plan_mapfuse_10f_epoch6_originshift_barefp16_20260706_motion_compare_fixed.webm
+base_e2e_lidar_plan_mapfuse_10f_epoch6_originshift_barefp16_20260706_planning_fixed.webm
+base_e2e_lidar_plan_mapfuse_10f_epoch6_originshift_barefp16_20260706_all_fixed.webm
 ```
 
 模式含义：

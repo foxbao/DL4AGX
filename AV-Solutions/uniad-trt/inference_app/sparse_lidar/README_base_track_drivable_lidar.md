@@ -56,6 +56,10 @@ inference_app/sparse_lidar/build/base_track_drivable_full_smoke/*
 
 ## 模型边界
 
+> 本路径基于 `base_track_lidar`，部署流程与其一致（准备数据 → 导出 ONNX →
+> 编译 Engine → C++ Runtime）。下面按 `sparse encoder → backbone+neck →
+> dense` 的实际依赖顺序边导出边编译。
+
 `base_track_drivable_lidar.py` 继承 `base_track_lidar.py`，新增的是
 `LidarDrivableHead`。部署时 dense engine 的输入仍然是：
 
@@ -75,7 +79,7 @@ drivable_score: 1x120x160
 `drivable_score` 是 float score map，C++ runtime 侧再做阈值，例如 `> 0.5`。
 这样比直接导出 bool mask 更适合 TensorRT 输出和后处理可视化。
 
-## 环境
+## 0. 环境
 
 以下命令默认从仓库根目录执行：
 
@@ -93,7 +97,9 @@ export DRIVABLE_TRT_CFG=$PWD/UniAD/projects/configs/stage1_track_map_lidar/base_
 export TAG=epoch2
 ```
 
-## Sparse Encoder ONNX
+## 2. 导出 ONNX
+
+### 2.1 Sparse Encoder ONNX
 
 这一步导出 libspconv runtime 使用的 sparse encoder ONNX，同时保存一份用于检查的
 libspconv tensor dump。
@@ -120,7 +126,7 @@ Exported sparse ONNX: onnx/base_track_drivable_lidar_sparse_encoder_epoch2.onnx
 Input features: [621662, 4], coors: [621662, 4], dense: [5, 256, 120, 160]
 ```
 
-## Backbone+Neck ONNX / Engine
+### 2.2 Backbone+Neck ONNX / Engine
 
 ```bash
 cd UniAD_train/UniAD
@@ -147,7 +153,7 @@ $TRT_PATH/bin/trtexec \
 
 已验证 TensorRT 10.7.0.23 可以成功编译，engine 大约 9 MiB。
 
-## Dense Track+Drivable ONNX
+### 2.3 Dense Track+Drivable ONNX
 
 ```bash
 cd UniAD
@@ -173,7 +179,9 @@ cd -
 plugin op 报 unknown op，这和现有 UniAD TRT ONNX 一样；应以 TensorRT parser/
 engine build 为准。
 
-## Dense Track+Drivable Engine
+## 4. 编译 TensorRT Engine
+
+### 4.1 Dense Track+Drivable Engine
 
 ```bash
 mkdir -p UniAD/engine
@@ -197,7 +205,7 @@ $TRT_PATH/bin/trtexec \
 
 已验证 TensorRT 10.7.0.23 可以成功编译，engine 大约 69 MiB。
 
-## Engine Inference Smoke Test
+### 4.2 Engine Inference Smoke Test
 
 ```bash
 L=601
@@ -221,7 +229,7 @@ drivable_score: 1x120x160
 随机输入 smoke 的平均 Host latency 约 15 ms；这个数只用于确认 engine 能跑，
 不代表真实端到端性能。
 
-## C++ Runtime
+## 5. C++ Runtime 运行
 
 已新增一个独立二进制，避免影响已经验证过的 `uniad_lidar_track`：
 

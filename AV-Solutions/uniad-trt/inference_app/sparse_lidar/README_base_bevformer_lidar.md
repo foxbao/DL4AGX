@@ -250,7 +250,7 @@ $TRT_PATH/bin/trtexec \
   --skipInference
 ```
 
-## 5. 运行部署链
+## 5. C++ Runtime 运行
 
 `uniad_lidar` 会从 raw points 开始跑完整链路，并在多帧时把上一帧
 `bev_embed` 作为下一帧 `prev_bev`。第 0 帧会使用零 `prev_bev` 和

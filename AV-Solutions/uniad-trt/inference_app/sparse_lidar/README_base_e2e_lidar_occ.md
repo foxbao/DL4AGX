@@ -169,6 +169,10 @@ test_with_track_score = True
 
 ## 6. TensorRT 部署记录（2026-07-06）
 
+> 本节是标准 LiDAR 部署流程（导出 ONNX → 编译 Engine → C++ Runtime），与
+> `README_base_e2e_lidar.md` 一致，仅 dense engine 多一个 `seg_out` 输出。
+> 前面第 1–5 节是 PyTorch 侧的 occ 可视化工具，与 TensorRT 部署独立。
+
 本次新增/修改的部署侧文件：
 
 - `UniAD/projects/configs/stage2_e2e_lidar/base_e2e_lidar_occ_trt_p.py`
