@@ -1,5 +1,11 @@
 # UniAD base_e2e_lidar TensorRT 部署流程
 
+> **FP16 数值卫生（2026-07-07）**：本路径继承 `UniADTrackLidarTRT.velo_update_trt`，
+> 存在全局坐标 FP16 灾难性抵消隐患，已在源码修复。**engine 需用含修复的代码重新导出**；
+> 2026-07-07 之前构建的 engine 不含修复。本机已验证重导出后裸 FP16 10 帧全 finite
+> （`tools/verify_fp16_all_paths.sh`）。根因与验证矩阵见 `MAPFUSE_FP16_NAN_ANALYSIS.md`
+> 第 11–12 节。
+
 这份文档记录 `stage2_e2e_lidar/base_e2e_lidar.py` 的 LiDAR E2E 部署链路。
 它在 `base_track_lidar.py` 的 tracking 链路后面接上 MotionHead：
 
@@ -31,7 +37,7 @@ TensorRT engine 只有两段：`backbone+neck` 和 dense E2E `track+motion`。
   `UniAD/engine/base_e2e_lidar_backbone_neck_epoch2.engine` 和
   `UniAD/engine/base_e2e_lidar_trt_epoch2.engine`。
 - 已用 `uniad_lidar_e2e` 跑通 10 帧 raw-points runtime：
-  `UniAD/output/base_e2e_lidar_epoch2_10f`。
+  `UniAD_train/UniAD/output/base_e2e_lidar_epoch2_10f`。
 
 相关实测日志：
 
@@ -47,6 +53,8 @@ UniAD/logs/uniad_lidar_e2e_epoch2_10f.log
 - `UniAD_train/UniAD`：训练侧代码，导出 sparse encoder ONNX、backbone+neck
   ONNX，并准备 raw-points 部署输入数据。
 - `UniAD`：部署侧代码，导出 dense E2E TensorRT 边界 ONNX。
+- runtime 输出统一放在 `UniAD_train/UniAD/output/`；历史上生成在 `UniAD/output/`
+  下的目录已经剪切到该位置。
 - `inference_app/enqueueV3`：TensorRT 10.x plugin 工程，生成
   `libuniad_plugin.so`。
 - `inference_app/sparse_lidar`：LiDAR C++ runtime。`uniad_lidar_e2e` 是
@@ -373,7 +381,7 @@ GPU Compute Time median: 16.4465 ms
 ```bash
 export LD_LIBRARY_PATH=$TRT_PATH/lib:$LD_LIBRARY_PATH
 
-rm -rf UniAD/output/base_e2e_lidar_${TAG}_${NUM_FRAMES}f
+rm -rf UniAD_train/UniAD/output/base_e2e_lidar_${TAG}_${NUM_FRAMES}f
 
 inference_app/sparse_lidar/build/uniad_lidar_e2e \
   UniAD_train/UniAD/onnx/base_e2e_lidar_sparse_encoder_${TAG}.onnx \
@@ -381,7 +389,7 @@ inference_app/sparse_lidar/build/uniad_lidar_e2e \
   UniAD/engine/base_e2e_lidar_trt_${TAG}.engine \
   inference_app/enqueueV3/build/libuniad_plugin.so \
   UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_deploy_data_${NUM_FRAMES}f \
-  UniAD/output/base_e2e_lidar_${TAG}_${NUM_FRAMES}f \
+  UniAD_train/UniAD/output/base_e2e_lidar_${TAG}_${NUM_FRAMES}f \
   $NUM_FRAMES \
   --metadata-json UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_deploy_data_${NUM_FRAMES}f \
   --gt-detections UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_deploy_data_${NUM_FRAMES}f \
@@ -432,10 +440,10 @@ frame 9: 5 tracks, max_obj_id=5
 输出目录：
 
 ```text
-UniAD/output/base_e2e_lidar_epoch2_10f
+UniAD_train/UniAD/output/base_e2e_lidar_epoch2_10f
 ```
 
-### 5.1 生成 WebM 可视化
+### 5.1 旧版 SVG / Chrome 可视化（历史，不推荐）
 
 runtime 每帧都会生成：
 
@@ -445,11 +453,11 @@ frame_000000_bev_compare.svg
 ```
 
 `frame_*_bev.svg` 是 TRT E2E prediction；`frame_*_bev_compare.svg` 左侧是 GT
-boxes，右侧是 TRT prediction。可以用 `google-chrome` 把 SVG 渲成 PNG，再用
+boxes，右侧是 TRT prediction。历史上曾用 `google-chrome` 把 SVG 渲成 PNG，再用
 `ffmpeg` 合成 WebM：
 
 ```bash
-OUT=UniAD/output/base_e2e_lidar_${TAG}_${NUM_FRAMES}f
+OUT=UniAD_train/UniAD/output/base_e2e_lidar_${TAG}_${NUM_FRAMES}f
 mkdir -p $OUT/video_frames_pred $OUT/video_frames_compare
 export OUT
 
@@ -492,14 +500,10 @@ ffmpeg -y -framerate 2 -i $OUT/video_frames_compare/frame_%06d.png \
   $OUT/base_e2e_lidar_compare_${NUM_FRAMES}f_${TAG}.webm
 ```
 
-本机 `epoch2` 已生成：
+这批旧版 WebM 和中间帧目录已经清理。后续常规查看请使用第 5.3 节的统一固定画布
+`*_fixed.webm`；本节仅保留旧流程用于排查 SVG 生成逻辑。
 
-```text
-UniAD/output/base_e2e_lidar_epoch2_10f/base_e2e_lidar_pred_10f_epoch2.webm
-UniAD/output/base_e2e_lidar_epoch2_10f/base_e2e_lidar_compare_10f_epoch2.webm
-```
-
-### 5.2 生成 MotionHead 轨迹可视化
+### 5.2 旧版 MotionHead SVG 可视化（历史，不推荐）
 
 `base_e2e_lidar.py` 里的 `motion_head.type='MotionHeadLidar'` 输出多模态未来
 轨迹。部署侧 dense E2E engine 会写出：
@@ -532,7 +536,7 @@ num_tracks x 6 x 12 x 5
 
 ```bash
 python3 inference_app/sparse_lidar/visualize_e2e_motion.py \
-  UniAD/output/base_e2e_lidar_${TAG}_${NUM_FRAMES}f \
+  UniAD_train/UniAD/output/base_e2e_lidar_${TAG}_${NUM_FRAMES}f \
   --gt-dir UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_deploy_data_${NUM_FRAMES}f \
   --num-frames $NUM_FRAMES \
   --top-modes 6 \
@@ -551,7 +555,7 @@ frame_000000_motion_compare.svg
 合成 motion WebM：
 
 ```bash
-OUT=UniAD/output/base_e2e_lidar_${TAG}_${NUM_FRAMES}f
+OUT=UniAD_train/UniAD/output/base_e2e_lidar_${TAG}_${NUM_FRAMES}f
 mkdir -p $OUT/video_frames_motion $OUT/video_frames_motion_compare
 export OUT
 
@@ -594,11 +598,43 @@ ffmpeg -y -framerate 2 -i $OUT/video_frames_motion_compare/frame_%06d.png \
   $OUT/base_e2e_lidar_motion_compare_${NUM_FRAMES}f_${TAG}.webm
 ```
 
-本机 `epoch2` 已生成：
+这批旧版 motion WebM 和中间帧目录也已经清理。后续常规查看请使用第 5.3 节的
+`motion_fixed.webm`、`motion_compare_fixed.webm` 和 `all_fixed.webm`。
+
+### 5.3 统一固定画布可视化（推荐）
+
+前面的 Chrome 截 SVG 流程是历史记录；现在推荐用统一工具直接从 runtime 输出生成
+固定画布 WebM，避免不同 SVG / browser viewport 造成视频一会儿大、一会儿小或带
+白边。
+
+统一工具：
 
 ```text
-UniAD/output/base_e2e_lidar_epoch2_10f/base_e2e_lidar_motion_10f_epoch2.webm
-UniAD/output/base_e2e_lidar_epoch2_10f/base_e2e_lidar_motion_compare_10f_epoch2.webm
+inference_app/sparse_lidar/visualize_e2e_outputs.py
+```
+
+本工具固定输出 `1200x900`、2 fps，支持 detection、GT compare、MotionHead
+trajectory 和 all-in-one 视图：
+
+```bash
+python3 inference_app/sparse_lidar/visualize_e2e_outputs.py \
+  UniAD_train/UniAD/output/base_e2e_lidar_epoch2_10f_fullcheck_20260706 \
+  --data-dir UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_deploy_data_10f \
+  --gt-dir UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_deploy_data_10f \
+  --num-frames 10 \
+  --tag base_e2e_lidar_10f_epoch2_fullcheck_20260706 \
+  --modes pred compare motion motion_compare all \
+  --width 1200 --height 900 --fps 2 --min-score 0.2
+```
+
+本机已重新生成统一固定画布版本：
+
+```text
+UniAD_train/UniAD/output/base_e2e_lidar_epoch2_10f_fullcheck_20260706/base_e2e_lidar_10f_epoch2_fullcheck_20260706_pred_fixed.webm
+UniAD_train/UniAD/output/base_e2e_lidar_epoch2_10f_fullcheck_20260706/base_e2e_lidar_10f_epoch2_fullcheck_20260706_compare_fixed.webm
+UniAD_train/UniAD/output/base_e2e_lidar_epoch2_10f_fullcheck_20260706/base_e2e_lidar_10f_epoch2_fullcheck_20260706_motion_fixed.webm
+UniAD_train/UniAD/output/base_e2e_lidar_epoch2_10f_fullcheck_20260706/base_e2e_lidar_10f_epoch2_fullcheck_20260706_motion_compare_fixed.webm
+UniAD_train/UniAD/output/base_e2e_lidar_epoch2_10f_fullcheck_20260706/base_e2e_lidar_10f_epoch2_fullcheck_20260706_all_fixed.webm
 ```
 
 ## 6. 已验证命令
@@ -618,9 +654,10 @@ UniAD/output/base_e2e_lidar_epoch2_10f/base_e2e_lidar_motion_compare_10f_epoch2.
 - TensorRT 10.7 `trtexec --loadEngine` 成功加载并随机输入推理 dense E2E engine。
 - `uniad_lidar_e2e` 跑通 10 帧 raw-points runtime，并写出 detection、track
   state、BEV SVG 和 trajectory tensors。
-- `google-chrome` + `ffmpeg` 生成 10 帧 prediction-only 和 GT-compare WebM。
-- `visualize_e2e_motion.py` 生成 MotionHead 轨迹 SVG，并合成 prediction-only
-  和 GT-compare motion WebM。
+- 旧版 `google-chrome` + `ffmpeg` 和 `visualize_e2e_motion.py` 流程曾用于生成
+  WebM，相关旧视频和中间帧目录已清理。
+- `visualize_e2e_outputs.py` 重新生成统一 `1200x900` 固定画布 WebM；后续推荐使用
+  `*_fixed.webm`，旧 Chrome/SVG 合成视频仅保留为历史产物。
 
 本机关键产物尺寸：
 
@@ -630,10 +667,97 @@ UniAD_train/UniAD/onnx/base_e2e_lidar_backbone_neck_epoch2.onnx       17M
 UniAD/onnx/base_e2e_lidar_trt_epoch2.repaired.onnx                   120M
 UniAD/engine/base_e2e_lidar_backbone_neck_epoch2.engine              8.9M
 UniAD/engine/base_e2e_lidar_trt_epoch2.engine                         80M
-UniAD/output/base_e2e_lidar_epoch2_10f                               413M
+UniAD_train/UniAD/output/base_e2e_lidar_epoch2_10f                               413M
 ```
 
-## 7. 后续 checkpoint
+## 7. 2026-07-06 复跑记录
+
+在 GPU 权限恢复后，使用已有 `epoch2` ONNX、TensorRT engine、plugin 和 10 帧部署
+输入重新跑了一次完整 runtime，没有重新导出 ONNX 或重编 engine。
+
+复跑环境：
+
+```text
+Driver Version: 580.126.09
+CUDA Version: 13.0
+GPU: NVIDIA GeForce RTX 4090
+TensorRT runtime: /home/baojiali/Downloads/TensorRT-10.7.0.23
+CUDA_VISIBLE_DEVICES: <unset>
+```
+
+复跑命令：
+
+```bash
+TRT_PATH=/home/baojiali/Downloads/TensorRT-10.7.0.23
+export LD_LIBRARY_PATH=$TRT_PATH/lib:$LD_LIBRARY_PATH
+
+OUT=UniAD_train/UniAD/output/base_e2e_lidar_epoch2_10f_rerun_20260706
+LOG=UniAD/logs/uniad_lidar_e2e_epoch2_10f_rerun_20260706.log
+
+rm -rf "$OUT"
+
+inference_app/sparse_lidar/build/uniad_lidar_e2e \
+  UniAD_train/UniAD/onnx/base_e2e_lidar_sparse_encoder_epoch2.onnx \
+  UniAD/engine/base_e2e_lidar_backbone_neck_epoch2.engine \
+  UniAD/engine/base_e2e_lidar_trt_epoch2.engine \
+  inference_app/enqueueV3/build/libuniad_plugin.so \
+  UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_deploy_data_10f \
+  "$OUT" \
+  10 \
+  --metadata-json UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_deploy_data_10f \
+  --gt-detections UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_deploy_data_10f \
+  --track-init-dir UniAD/dumped_inputs/base_e2e_lidar_trt_trace_epoch2 \
+  --track-state-len 601 \
+  --max-track-state-len 1201 \
+  --score-threshold 0.2 \
+  --bev-max-draw 200 \
+  2>&1 | tee "$LOG"
+```
+
+复跑结果：
+
+```text
+frame 0: 4 tracks, max_obj_id=4
+frame 1: 4 tracks, max_obj_id=4
+frame 2: 4 tracks, max_obj_id=4
+frame 3: 4 tracks, max_obj_id=4
+frame 4: 4 tracks, max_obj_id=4
+frame 5: 5 tracks, max_obj_id=5
+frame 6: 5 tracks, max_obj_id=5
+frame 7: 5 tracks, max_obj_id=5
+frame 8: 5 tracks, max_obj_id=5
+frame 9: 5 tracks, max_obj_id=5
+```
+
+输出检查：
+
+```text
+detections=10
+bev_svg=10
+bev_compare_svg=10
+traj_bin=10
+valid_traj_masks_bin=10
+```
+
+随后曾重新生成 MotionHead SVG 和 4 个旧版 WebM：
+
+```bash
+python3 inference_app/sparse_lidar/visualize_e2e_motion.py \
+  UniAD_train/UniAD/output/base_e2e_lidar_epoch2_10f_rerun_20260706 \
+  --gt-dir UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_deploy_data_10f \
+  --num-frames 10 \
+  --top-modes 6 \
+  --min-score 0.2
+```
+
+这批旧版可视化产物已经清理；当前保留并推荐查看的是第 5.3 节列出的统一
+`*_fixed.webm`。
+
+本次复跑确认 `base_e2e_lidar.py` 的 sparse encoder ONNX、backbone+neck engine、
+dense E2E engine、C++ runtime、tracking state 更新和 MotionHead trajectory 输出
+可以在当前机器上跑通 10 帧 raw-points 部署链路。
+
+## 8. 后续 checkpoint
 
 训练继续产生新 epoch 后，推荐不要覆盖 `epoch2` 产物，改成新的 `TAG`：
 

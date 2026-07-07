@@ -1,5 +1,11 @@
 # UniAD base_track_lidar TensorRT 部署流程
 
+> **FP16 数值修复（2026-07-07）**：`velo_update_trt`（track ref_pts 跨帧传播）
+> 存在全局坐标 FP16 灾难性抵消，已修复（先在 fp32 算 `l2g_t1 - l2g_t2`）。
+> **engine 必须用含此修复的代码重新导出才生效**；旧 engine 不含修复。
+> 本机已验证重导出后裸 FP16 10 帧全 finite（脚本 `tools/verify_fp16_all_paths.sh`）。
+> 原理与全路径验证矩阵见 `MAPFUSE_FP16_NAN_ANALYSIS.md` §11–§12。
+
 这份文档记录 `stage1_track_map_lidar/base_track_lidar.py` 的部署规划和当前实现状态。
 它复用已经跑通的 `base_bevformer_lidar.py` sparse LiDAR 链路：
 

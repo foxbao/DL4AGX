@@ -1,8 +1,8 @@
 # Mapfuse TensorRT FP16 NaN 问题分析
 
 本文档记录 `base_e2e_lidar_plan_mapfuse.py` 部署时，TensorRT dense planning
-engine 在裸 `--fp16` 下输出 `sdc_traj = NaN` 的问题、排查过程、当前可用修复方案
-和后续可继续优化的方向。
+engine 在旧 ONNX 裸 `--fp16` 下输出 `sdc_traj = NaN` 的问题、排查过程、根因定位
+和当前推荐的 origin-shift 裸 FP16 部署方案。
 
 ## 1. 问题摘要
 
@@ -16,12 +16,15 @@ MapLaneEncoderTRT
   -> ego planning sdc_traj
 ```
 
-裸 `--fp16` TensorRT dense mapfuse engine 可以 build 成功，但运行 10 帧 runtime 后，
+未做 origin-shift 修复的裸 `--fp16` TensorRT dense mapfuse engine 可以 build 成功，但运行 10 帧 runtime 后，
 `frame_XXXXXX_sdc_traj.bin` 全部为 `NaN`。同一模型在 PyTorch dense forward 下正常；
 TensorRT full-FP32 dense engine 也正常。
 
 因此问题不是 C++ runtime 写文件错误，也不是 ONNX export 完全错误，而是
-**TensorRT FP16 下 mapfuse planning 分支存在数值不稳定 / 溢出传播**。
+**TensorRT FP16 下 map 分支全局坐标变换存在大数相减的灾难性抵消**。修复方式不是把
+map 分支永久改成 FP32，而是在 `MapLaneEncoderTRT` 中把静态 HD-map 坐标先做
+origin-shift，使进入 FP16 图内的坐标量级从 ~3000 m 降到百米量级。修复后，dense
+mapfuse engine 可用裸 `--fp16`、零 FP32 layer 约束运行，`sdc_traj` 全 finite。
 
 ## 2. 相关产物
 
@@ -44,14 +47,10 @@ front sparse ONNX:
 front backbone+neck engine:
   UniAD/engine/base_e2e_lidar_plan_mapfuse_backbone_neck_epoch6.engine
 
-dense ONNX after FP16-safety code patch:
-  UniAD/onnx/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp16safe.repaired.onnx
-recommended dense engine (localized 69-node map island, see section 9):
-  UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_mapisland69.engine
-fp32 spec for that engine (node names, bound to the ONNX above):
-  UniAD/onnx/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp16safe.mapisland69.fp32spec.txt
-earlier wildcard engine (1101-node hammer, superseded):
-  UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp16safe_attnfp32.engine
+recommended dense ONNX after origin-shift:
+  UniAD/onnx/base_e2e_lidar_plan_mapfuse_trt_epoch6_originshift.repaired.onnx
+recommended dense engine (bare FP16, zero FP32 constraints):
+  UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_originshift_barefp16.engine
 fallback dense engine:
   UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp32.engine
 ```
@@ -60,16 +59,16 @@ fallback dense engine:
 
 ```text
 recommended runtime output:
-  UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_attnfp32_20260706/
+  UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_originshift_barefp16_20260706/
 recommended runtime log:
-  UniAD/logs/uniad_lidar_e2e_plan_mapfuse_epoch6_10f_attnfp32_20260706.log
+  UniAD/logs/uniad_lidar_e2e_plan_mapfuse_epoch6_10f_originshift_barefp16_20260706.log
 recommended trtexec log:
-  UniAD/logs/trtexec_base_e2e_lidar_plan_mapfuse_trt_epoch6_fp16safe_attnfp32.log
+  UniAD/logs/trtexec_base_e2e_lidar_plan_mapfuse_trt_epoch6_originshift_barefp16.log
 ```
 
 ## 3. 现象复现
 
-裸 `--fp16` dense engine：
+旧 ONNX 裸 `--fp16` dense engine：
 
 ```text
 UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6.engine
@@ -93,8 +92,9 @@ TensorRT full FP32:    normal, sdc_traj finite
 TensorRT bare FP16:    abnormal, sdc_traj NaN
 ```
 
-这说明 NaN 更可能来自 TensorRT FP16 kernel / graph fusion / precision selection，而不是
-checkpoint、本地 runtime 输出解析或 planning 输出 layout。
+这说明 NaN 来自 TensorRT FP16 数值路径，而不是 checkpoint、本地 runtime 输出解析或
+planning 输出 layout。后续第 9-10 节进一步证明，真正根因是 map 分支内全局坐标
+`points - ego_translation` 的 FP16 大数抵消。
 
 ## 4. 排查过程
 
@@ -160,9 +160,10 @@ sdc_traj 仍然全 NaN
 这说明 NaN 不只来自 LayerNorm 的 reduce/pow/sqrt，attention / MLP 的矩阵乘、
 softmax 或后续除法同样参与了不稳定传播。
 
-### 4.3 第三轮：attention / MLP / normalization 计算岛 FP32
+### 4.3 第三轮：attention / MLP / normalization 计算岛 FP32（历史中间方案）
 
-最终可用方案是在整体 `--fp16` 下，对以下算子族施加 FP32 约束：
+在 root-cause 修复前，当时可用的中间方案是在整体 `--fp16` 下，对以下算子族施加 FP32
+约束：
 
 ```text
 MatMul*:fp32
@@ -182,17 +183,18 @@ engine build success
 sdc_traj all finite
 ```
 
-这说明当前问题主要位于 mapfuse planning 分支里的 attention / MLP / normalization
-混合计算岛，而不是单个 mask 常量或单个 LayerNorm 节点。
+这说明全图通配 FP32 约束确实覆盖到了导致 NaN 的路径，但不能据此断定 attention 本身是
+根因。第 9-10 节后续实验进一步把问题定位到 map 分支全局坐标变换的 FP16 大数抵消；
+origin-shift 后不再需要这些 FP32 layer 约束。
 
-## 5. 当前推荐修复方案
+## 5. 当前推荐修复方案：origin-shift 裸 FP16
 
 ### 5.1 保留代码修复
 
 保留 `1.0e8 -> 1.0e4` 的修复，避免 invalid lane sentinel 在 FP16 下直接变成
 `inf`。虽然这不是充分条件，但它是必要的数值卫生修复。
 
-### 5.2 使用 FP16 + FP32 attention island 构建 dense engine
+### 5.2 使用 origin-shift 后的裸 FP16 dense engine
 
 推荐 dense engine 构建命令：
 
@@ -205,18 +207,15 @@ MAX=1201
 TRACK_SHAPES="prev_track_intances0:Lx512,prev_track_intances1:Lx3,prev_track_intances3:L,prev_track_intances4:L,prev_track_intances5:L,prev_track_intances6:L,prev_track_intances8:L,prev_track_intances9:Lx10,prev_track_intances11:Lx4x256,prev_track_intances12:Lx4,prev_track_intances13:L"
 
 "$TRT_PATH/bin/trtexec" \
-  --onnx=UniAD/onnx/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp16safe.repaired.onnx \
-  --saveEngine=UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp16safe_attnfp32.engine \
+  --onnx=UniAD/onnx/base_e2e_lidar_plan_mapfuse_trt_epoch6_originshift.repaired.onnx \
+  --saveEngine=UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_originshift_barefp16.engine \
   --staticPlugins=inference_app/enqueueV3/build/libuniad_plugin.so \
   --fp16 \
-  --precisionConstraints=prefer \
-  --layerPrecisions=MatMul*:fp32,Gemm*:fp32,Softmax*:fp32,ReduceMean*:fp32,Pow*:fp32,Sqrt*:fp32,Div*:fp32 \
-  --layerOutputTypes=MatMul*:fp32,Gemm*:fp32,Softmax*:fp32,ReduceMean*:fp32,Pow*:fp32,Sqrt*:fp32,Div*:fp32 \
   --minShapes=${TRACK_SHAPES//L/${MIN}} \
   --optShapes=${TRACK_SHAPES//L/${OPT}} \
   --maxShapes=${TRACK_SHAPES//L/${MAX}} \
   --skipInference \
-  2>&1 | tee UniAD/logs/trtexec_base_e2e_lidar_plan_mapfuse_trt_epoch6_fp16safe_attnfp32.log
+  2>&1 | tee UniAD/logs/trtexec_base_e2e_lidar_plan_mapfuse_trt_epoch6_originshift_barefp16.log
 ```
 
 ### 5.3 Runtime 命令
@@ -224,20 +223,20 @@ TRACK_SHAPES="prev_track_intances0:Lx512,prev_track_intances1:Lx3,prev_track_int
 ```bash
 TRT_PATH=/home/baojiali/Downloads/TensorRT-10.7.0.23
 export LD_LIBRARY_PATH="$TRT_PATH/lib:${LD_LIBRARY_PATH-}"
-OUT=UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_attnfp32_20260706
-LOG=UniAD/logs/uniad_lidar_e2e_plan_mapfuse_epoch6_10f_attnfp32_20260706.log
+OUT=UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_originshift_barefp16_20260706
+LOG=UniAD/logs/uniad_lidar_e2e_plan_mapfuse_epoch6_10f_originshift_barefp16_20260706.log
 
 rm -rf "$OUT"
 inference_app/sparse_lidar/build/uniad_lidar_e2e \
   UniAD_train/UniAD/onnx/base_e2e_lidar_plan_mapfuse_sparse_encoder_epoch6.onnx \
   UniAD/engine/base_e2e_lidar_plan_mapfuse_backbone_neck_epoch6.engine \
-  UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp16safe_attnfp32.engine \
+  UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_originshift_barefp16.engine \
   inference_app/enqueueV3/build/libuniad_plugin.so \
   UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_plan_mapfuse_deploy_data_10f \
   "$OUT" 10 \
   --metadata-json UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_plan_mapfuse_deploy_data_10f \
   --gt-detections UniAD_train/UniAD/dumped_inputs/base_e2e_lidar_plan_mapfuse_deploy_data_10f \
-  --track-init-dir UniAD/dumped_inputs/base_e2e_lidar_plan_mapfuse_trt_trace_epoch6_fp16safe \
+  --track-init-dir UniAD/dumped_inputs/base_e2e_lidar_plan_mapfuse_trt_trace_epoch6_originshift \
   --track-state-len 601 \
   --max-track-state-len 1201 \
   --command 2 \
@@ -248,26 +247,17 @@ inference_app/sparse_lidar/build/uniad_lidar_e2e \
 
 ## 6. 验证结果
 
-### 6.1 attnfp32 输出
+### 6.1 origin-shift bare-FP16 输出
 
 ```text
 output:
-  UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_attnfp32_20260706/
+  UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_originshift_barefp16_20260706/
 sdc_traj files:
   10
 all finite:
   true
 global min/max:
-  -0.150634765625 / 6.6015625
-```
-
-抽查：
-
-```text
-frame_000000 first=[0.7432, -0.0188], last=[4.3359, -0.1506]
-frame_000001 first=[0.8462,  0.0027], last=[5.0781, -0.0136]
-frame_000005 first=[0.9360, -0.0082], last=[5.5703, -0.0786]
-frame_000009 first=[1.0918,  0.0257], last=[6.6016,  0.1272]
+  all finite; 10-frame runtime verified
 ```
 
 ### 6.2 和 full FP32 对比
@@ -281,8 +271,8 @@ UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_full_20260706/
 对比结果：
 
 ```text
-vs full-FP32 max abs diff:  0.0912 m
-vs full-FP32 mean abs diff: 0.0165 m
+vs full-FP32 max abs diff:  0.0958 m
+vs full-FP32 mean abs diff: 0.0162 m
 ```
 
 该差异量级在 10 帧 smoke test 上可接受；后续如果要作为正式性能/精度结论，需要扩大到
@@ -293,18 +283,18 @@ vs full-FP32 mean abs diff: 0.0165 m
 统一可视化输出位于：
 
 ```text
-UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_attnfp32_20260706/
+UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_originshift_barefp16_20260706/
 ```
 
 保留 6 个固定画布 WebM：
 
 ```text
-base_e2e_lidar_plan_mapfuse_10f_epoch6_attnfp32_20260706_pred_fixed.webm
-base_e2e_lidar_plan_mapfuse_10f_epoch6_attnfp32_20260706_compare_fixed.webm
-base_e2e_lidar_plan_mapfuse_10f_epoch6_attnfp32_20260706_motion_fixed.webm
-base_e2e_lidar_plan_mapfuse_10f_epoch6_attnfp32_20260706_motion_compare_fixed.webm
-base_e2e_lidar_plan_mapfuse_10f_epoch6_attnfp32_20260706_planning_fixed.webm
-base_e2e_lidar_plan_mapfuse_10f_epoch6_attnfp32_20260706_all_fixed.webm
+base_e2e_lidar_plan_mapfuse_10f_epoch6_originshift_barefp16_20260706_pred_fixed.webm
+base_e2e_lidar_plan_mapfuse_10f_epoch6_originshift_barefp16_20260706_compare_fixed.webm
+base_e2e_lidar_plan_mapfuse_10f_epoch6_originshift_barefp16_20260706_motion_fixed.webm
+base_e2e_lidar_plan_mapfuse_10f_epoch6_originshift_barefp16_20260706_motion_compare_fixed.webm
+base_e2e_lidar_plan_mapfuse_10f_epoch6_originshift_barefp16_20260706_planning_fixed.webm
+base_e2e_lidar_plan_mapfuse_10f_epoch6_originshift_barefp16_20260706_all_fixed.webm
 ```
 
 规格：
@@ -340,11 +330,11 @@ attention (`planning_head.attn_module`) 全程保留 FP16，`sdc_traj` 仍然全
 Div}` 交集，得到 **69 个节点**。逐节点名 FP32 约束后 `sdc_traj` 全 finite，且比 1101 层
 大锤更接近 full-fp32。详见第 9 节。
 
-### 8.2 尝试 ONNX opset 17 / INormalizationLayer
+### 8.2 ONNX opset 17 / INormalizationLayer（非当前主线）
 
 TensorRT 日志提示 LayerNorm FP16 reduce/pow 可能溢出。后续可以尝试更高 ONNX opset
-或导出成 TensorRT 更容易识别的 normalization 层。不过本次实验显示仅修 LayerNorm
-不够，因此即使改善 LayerNorm，也仍需关注 attention softmax / matmul。
+或导出成 TensorRT 更容易识别的 normalization 层。不过本次 root-cause 已定位为 map
+坐标抵消，origin-shift 裸 FP16 已通过 10 帧验证；normalization 优化不再是当前部署主线。
 
 ### 8.3 增加更多验证数据
 
@@ -352,7 +342,7 @@ TensorRT 日志提示 LayerNorm FP16 reduce/pow 可能溢出。后续可以尝�
 
 ```text
 1. 多 scene runtime
-2. full FP32 vs attnfp32 trajectory diff 分布
+2. full FP32 vs origin-shift bare-FP16 trajectory diff 分布
 3. planning L2 / collision 等指标（如果数据中有 planning GT）
 4. runtime latency / memory 对比
 ```
@@ -365,8 +355,9 @@ TensorRT 日志提示 LayerNorm FP16 reduce/pow 可能溢出。后续可以尝�
 UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp32.engine
 ```
 
-如果后续发现 mapisland69 在更大数据集上仍有个别 NaN 或指标异常，可以回退到 full FP32
-dense engine 继续部署验证。
+如果后续发现 origin-shift bare-FP16 在更大数据集上仍有个别 NaN 或指标异常，可以回退到
+full FP32 dense engine 继续部署验证。mapisland69 / attnfp32 已作为历史中间产物清理；
+需要复现时再按第 9 节方法重新生成。
 
 ## 9. 定位实验：map 分支 69 节点 FP32 足以消除 NaN（推翻第 7 节初始结论）
 
@@ -403,14 +394,13 @@ sentinel）、2×Softmax + MatMul（map cross-attention）、1×ScatterElements�
 
 ### 9.3 构建与运行
 
-```bash
-bash tools/build_map_island_engine.sh \
-  UniAD/onnx/base_e2e_lidar_plan_mapfuse_trt_epoch6_fp16safe.mapisland69.fp32spec.txt \
-  UniAD/engine/base_e2e_lidar_plan_mapfuse_trt_epoch6_mapisland69.engine prefer
-```
+历史实验曾使用 `tools/build_map_island_engine.sh` 生成 69 节点 FP32 island engine。该 engine、
+fp32 spec、旧 fp16safe ONNX 和对应 runtime output 已在 2026-07-07 清理；如需复现，需要
+重新导出旧 ONNX、重新生成 spec，并重建 engine。
 
-trtexec 全部 69 层 `Set layer ... to precision fp32` 接受，build PASSED。runtime 命令与
-第 5.3 节一致，仅把 dense engine 换成 `..._mapisland69.engine`，输出目录：
+历史实验中，trtexec 全部 69 层 `Set layer ... to precision fp32` 接受，build PASSED。
+当时的 runtime 命令与第 5.3 节一致，仅把 dense engine 换成 `..._mapisland69.engine`。
+当时输出目录如下，当前本地已清理：
 
 ```text
 UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_mapisland69_20260706/
@@ -541,7 +531,83 @@ output: UniAD_train/UniAD/output/base_e2e_lidar_plan_mapfuse_epoch6_10f_originsh
 
 - **首选 origin-shift 裸 FP16**：无精度约束、engine 最简单、对 Orin 迁移最友好（不必维护绑定
   ONNX 的 69 节点 spec，无 `--precisionConstraints` 跨平台不确定性）。
-- mapisland69 / attnfp32 降为"不想改模型代码或重导出"时的备选。
+- mapisland69 / attnfp32 已降为历史实验记录，本地中间产物已清理；如需复现，再重新生成
+  旧 ONNX、FP32 spec 和对应 engine。
 - 诚实边界：① 仍为 10 帧 smoke test，非正式精度指标；② 未逐点用 debug tensor 抓首个 NaN
   节点——但裸 FP16 通过等于反证根因，不必再抓；③ Orin 上仍需重建并用实际 bin 复核 finite。
 
+## 11. 同型第二处：velo_update_trt 的全局坐标 FP16 抵消
+
+同一类"全局坐标进 traced op → FP16 灾难性抵消"的隐患在 track 分支也存在，位于
+`velo_update_trt`（跨帧传播 track reference points）：
+
+```python
+ref_pts = reference_points @ l2g_r1 + l2g_t1 - l2g_t2   # 朴素式
+```
+
+连续帧（changed=0）时 `l2g_t1`/`l2g_t2` 是**绝对 ego 全局平移**，实测 nuScenes 部署数据里
+约 **2700–3500 m**。先加 `l2g_t1`（抬到 ~3000 m）再减同量级的 `l2g_t2` 就是灾难性抵消，与
+`MapLaneEncoderTRT` 同因。
+
+### 11.1 修复
+
+在 fp32 域先算帧间平移差再加，数学恒等 `(a@R + t1) - t2 == a@R + (t1 - t2)`：
+
+```python
+trans_delta = (l2g_t1.float() - l2g_t2.float()).to(dtype=ref_pts.dtype)
+ref_pts = reference_points @ l2g_r1 + trans_delta
+```
+
+连续帧 `l2g_t1 - l2g_t2` 只有 ~0.88 m，进图张量不再出现 ~3000 m 中间量。改动落在部署树两条
+TRT 路径：`uniad_track_lidar.py`（LiDAR）与 `uniad_track.py`（camera）的 `velo_update_trt`；
+非-trt 的 plain `velo_update`（PyTorch fp32/fp64）保留朴素式，不进 FP16。
+
+### 11.2 验证（TRT-free 隔离）
+
+用真实 dump 的 ref_pts + 真实连续帧 l2g（|t|~3503 m，|t1-t2|~0.88 m）复刻新旧公式：
+
+```text
+fp64 new-vs-old 恒等: max|Δ| = 2.5e-13     （数学等价，不影响精度、无需重训）
+fp16 OLD 误差 vs truth: mean 0.5715 m  max 2.27 m
+fp16 NEW 误差 vs truth: mean 0.0050 m  max 0.057 m   （mean 改善 ~114x）
+```
+
+层精度实测（`--exportLayerInfo`）确认本机 SM89 上 OLD engine 的 `MatMul_885`（`@ l2g_r1`）
+输入/输出/tactic 全是 `Half`——**是真 FP16，不是 fp32 兜底**，抵消在本机真实存在。
+
+> 注意：当前 10 帧 smoke 部署数据是空 track 种子（obj_idx 全 -1）+ 每帧 reset，
+> `velo_update_trt` 不会被触发，因此端到端 A/B 看不到差异；改善由上面隔离测试证明。
+> 要端到端复现需构造非空活跃轨迹 + 连续帧 `use_prev_bev=1` 的输入。
+
+工具：`tools/velo_update_isolation.py`（隔离测试）、`tools/compare_track_ab.py`（严格 A/B，
+按 dtype 区分 int/float）。提交：子模块 UniAD `da7c5b8`，外层 `09db78f`。
+
+## 12. 全路径裸 FP16 finite 验证矩阵
+
+含 velo_update 修复的代码，对每条 tracking 部署路径重导出 ONNX → 建裸 `--fp16` engine →
+跑 10 帧 → 检查所有**浮点**输出 finite（int32 track-state 张量如 obj_idxes/labels/bbox_index
+排除；其 -1 sentinel 按 float32 误读会假报 nan）。
+
+```text
+环境: SM89 + TensorRT 10.7.0.23, 2026-07-07, 全部裸 --fp16
+路径            浮点输出文件   非有限    结论
+track_lidar     120           0         ALL_FINITE
+drivable        130           0         ALL_FINITE
+e2e_lidar       190           0         ALL_FINITE
+e2e_occ         200           0         ALL_FINITE
+plan-mapfuse    (第 10 节，origin-shift 裸 FP16)   ALL_FINITE
+bevformer       无 tracking / 无 velo_update，不受影响，未验
+```
+
+脚本：`tools/verify_fp16_all_paths.sh`（`RUN_ONLY="track drivable e2e occ"` 选路径）。
+
+**这一矩阵证明的是**：修复后代码在所有路径都能重导出→建 FP16 engine→跑通、无 NaN/inf
+（无回归、没弄坏任何路径）。**不是**端到端展示 velo_update 改善（smoke 数据未触发该路径，
+改善见第 11.2 节隔离测试）。Orin/DriveOS 上因 tactic 不同，finite 仍需在目标端重建 + 用
+实际 bin 复核。
+
+### 备注：反复出现的 int32-当-float32 假阳性
+
+本会话三次踩同一坑：把 int32 输出（obj_idxes/labels/bbox_index/track_instances 3/4/5/6/13/
+max_obj_id）按 float32 读，其 -1 sentinel 的 bit 模式被误认成 nan 或巨大差异。finite 检查与
+A/B diff 必须按 dtype 区分，见 `tools/compare_track_ab.py` 的 `INT_KEYS`。

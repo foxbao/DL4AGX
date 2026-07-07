@@ -1,5 +1,11 @@
 # UniAD base_track_drivable_lidar TensorRT 部署流程
 
+> **FP16 数值卫生（2026-07-07）**：本路径继承 `UniADTrackLidarTRT.velo_update_trt`，
+> 存在全局坐标 FP16 灾难性抵消隐患，已在源码修复。**engine 需用含修复的代码重新导出**；
+> 磁盘上 2026-07-07 之前构建的 engine 不含修复。本机已验证重导出后裸 FP16 10 帧
+> 全 finite（`tools/verify_fp16_all_paths.sh`）。根因与验证矩阵见
+> `MAPFUSE_FP16_NAN_ANALYSIS.md` 第 11–12 节。
+
 这份文档记录 `stage1_track_map_lidar/base_track_drivable_lidar.py` 的部署状态。
 它基于已经跑通的 `base_track_lidar` sparse LiDAR 链路，只在 dense head 末端新增
 drivable mask 输出。
